@@ -15,16 +15,10 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        powershell: [7.2, 7.3, 7.4]
     
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-    
-    - name: Setup PowerShell
-      uses: actions/setup-powershell@v2
-      with:
-        powershell-version: ${{ matrix.powershell }}
     
     - name: Install PSScriptAnalyzer
       shell: pwsh
@@ -73,11 +67,6 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
     
-    - name: Setup PowerShell
-      uses: actions/setup-powershell@v2
-      with:
-        powershell-version: '7.4'
-    
     - name: Create Module Package
       shell: pwsh
       run: |
@@ -111,11 +100,6 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-    
-    - name: Setup PowerShell
-      uses: actions/setup-powershell@v2
-      with:
-        powershell-version: '7.4'
     
     - name: Publish Module
       shell: pwsh
