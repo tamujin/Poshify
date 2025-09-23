@@ -1,0 +1,67 @@
+# PowerShell specific
+*.ps1xml
+*.ps1xml.bak
+*.psd1.bak
+*.psm1.bak
+
+# PowerShell Gallery package files
+*.nupkg
+*.zip
+
+# PowerShell profile backups
+.poshthemes\.profile_backup
+.poshthemes\*.backup
+
+# IDE and Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# Build and output directories
+bin/
+obj/
+out/
+build/
+dist/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+*.cache
+
+# PowerShell test results
+TestResults/
+*.TestResults.xml
+
+# Module development
+Modules/
+module/
+
+# Local development files
+.local/
+.dev/
+
+# Backup files
+*.backup
+*.bak
+*.old
+
+# Package management
+packages/
+node_modules/
+
+# Temporary PowerShell files
+*.ps1~
