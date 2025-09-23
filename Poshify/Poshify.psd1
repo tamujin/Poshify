@@ -75,7 +75,7 @@
             LicenseUri = 'https://opensource.org/licenses/MIT'
             
             # Project URI
-            ProjectUri = 'https://github.com/yourusername/Poshify'
+            ProjectUri = 'https://github.com/tamujin/Poshify'
             
             # Icon URI
             IconUri = ''
