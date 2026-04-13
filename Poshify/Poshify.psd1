@@ -38,6 +38,14 @@
         'Install-PoshifyTheme',
         'Set-PoshifyTheme',
         'Reset-PoshifyTheme',
+        'Get-PoshifyCurrentTheme',
+        'Remove-PoshifyTheme',
+        'Update-PoshifyTheme',
+        'Add-PoshifyFavorite',
+        'Remove-PoshifyFavorite',
+        'Get-PoshifyFavorite',
+        'Get-PoshifyRandomTheme',
+        'Test-PoshifyTheme',
         'Poshify'
     )
     
@@ -47,7 +55,15 @@
         'poshify-theme-find',
         'poshify-theme-install',
         'poshify-theme-set',
-        'poshify-theme-reset'
+        'poshify-theme-reset',
+        'poshify-theme-current',
+        'poshify-theme-remove',
+        'poshify-theme-update',
+        'poshify-favorite-add',
+        'poshify-favorite-remove',
+        'poshify-favorite-get',
+        'poshify-random',
+        'poshify-test'
     )
     
     # Cmdlets to export
@@ -82,6 +98,21 @@
             
             # Release notes
             ReleaseNotes = @'
+Version 2.0.0 - Major Update
+- NEW: Get-PoshifyCurrentTheme - Detect and display the currently active theme
+- NEW: Remove-PoshifyTheme - Remove installed themes with confirmation
+- NEW: Update-PoshifyTheme - Update themes to latest version (supports -All flag)
+- NEW: Add/Remove/Get-PoshifyFavorite - Manage favorite themes
+- NEW: Get-PoshifyRandomTheme - Apply random themes (supports -FromFavorites)
+- NEW: Test-PoshifyTheme - Preview theme information and structure
+- IMPROVED: Get-PoshifyTheme - Added -Detailed parameter for file info
+- IMPROVED: Find-PoshifyTheme - Added caching (60 min default) and -ForceRefresh
+- IMPROVED: GitHub API rate limit handling and monitoring
+- IMPROVED: Better error handling and user feedback
+- IMPROVED: Enhanced output formatting with counts and details
+- PERFORMANCE: Theme caching reduces API calls and improves response time
+- CLI: New aliases for all new functions
+
 Version 1.0.0 - Initial Release
 - Get-PoshifyTheme: List available local themes
 - Find-PoshifyTheme: Discover themes from oh-my-posh repository
