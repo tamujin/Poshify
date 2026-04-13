@@ -1,67 +1,29 @@
-# PowerShell specific
-*.ps1xml
-*.ps1xml.bak
-*.psd1.bak
-*.psm1.bak
+```
+# Compiled and build artifacts
+*.pyc
+__pycache__/
+*.o
+*.obj
 
-# PowerShell Gallery package files
-*.nupkg
-*.zip
+# Dependencies
+.venv/
+venv/
 
-# PowerShell profile backups
-.poshthemes\.profile_backup
-.poshthemes\*.backup
-
-# IDE and Editor files
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# OS generated files
-.DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
-Thumbs.db
-desktop.ini
-
-# Build and output directories
-bin/
-obj/
-out/
-build/
-dist/
-
-# Logs and temporary files
+# Logs and temp files
 *.log
 *.tmp
-*.temp
-*.cache
+*.swp
 
-# PowerShell test results
-TestResults/
-*.TestResults.xml
+# Environment
+.env
+.env.local
+*.env.*
 
-# Module development
-Modules/
-module/
+# Editors
+.vscode/
+.idea/
 
-# Local development files
-.local/
-.dev/
-
-# Backup files
-*.backup
-*.bak
-*.old
-
-# Package management
-packages/
-node_modules/
-
-# Temporary PowerShell files
-*.ps1~
+# PowerShell specific
+*.psd1
+*.psm1
+```
