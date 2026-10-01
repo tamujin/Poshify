@@ -7,29 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.1.0] - 2026-10-01
+## [2.1.0] - 2026-10-01
+
+Combines the 2.0.0 feature work with a rework of profile handling. 2.0.0 was never published
+to the PowerShell Gallery; its new commands were not exported by the module, so this is the first
+release where they are usable.
+
+### Added
+- `Get-PoshifyCurrentTheme`: the theme selected with `Set-PoshifyTheme`.
+- `Update-PoshifyTheme [-Name | -All]`: re-downloads themes whose content changed upstream,
+  detected by comparing git blob hashes (no extra requests).
+- `Remove-PoshifyTheme`: deletes a downloaded theme. Exact names only; refuses bundled themes and,
+  without `-Force`, the current theme.
+- `Show-PoshifyTheme`: renders the theme's prompt with `oh-my-posh print preview`
+  (replaces 2.0.0's `Test-PoshifyTheme`).
+- `Get-PoshifyRandomTheme [-FromFavorites]`: returns a random theme other than the current one;
+  pipe it to `Set-PoshifyTheme` (in 2.0.0 it applied the theme itself).
+- `Add-`, `Remove-`, `Get-PoshifyFavorite`, and a `Favorite` property on `Get-PoshifyTheme` output.
+- `Find-PoshifyTheme -ForceRefresh`; the online list is cached for an hour and a stale cache is
+  used when GitHub is unreachable.
+- CLI: `Poshify theme current|show|update|remove|random` and `Poshify favorite list|add|remove|random`.
+- `Set-PoshifyTheme` applies the theme to the current session (`-NoApply` to skip).
+- `-WhatIf`/`-Confirm` on all commands that change files.
+- `Install-PoshifyTheme -Force` and pipeline input (`Find-PoshifyTheme power* | Install-PoshifyTheme`).
+- Tab completion for theme and favorite names.
+- YAML and TOML theme files are recognised.
+- Pester test suite, run in CI on Windows, Linux, macOS and Windows PowerShell 5.1.
 
 ### Changed
 - The profile is managed through a single marked block (`# >>> poshify >>>` … `# <<< poshify <<<`)
   that is written once. The selected theme is stored in `~/.poshthemes/current`, so switching
   themes no longer rewrites the profile.
-- `Get-PoshifyTheme` now returns `Poshify.Theme` objects (`Name`, `Source`, `Current`, `Path`)
-  and also lists themes bundled with oh-my-posh (`$env:POSH_THEMES_PATH`).
+- `Get-PoshifyTheme` now returns `Poshify.Theme` objects (`Name`, `Source`, `Current`, `Favorite`,
+  `SizeKB`, `LastModified`, `Path`) instead of file objects, and also lists themes bundled with
+  oh-my-posh (`$env:POSH_THEMES_PATH`). This replaces 2.0.0's `-Detailed` switch.
 - Exact theme names take precedence over partial matches. Ambiguous names now produce an error
   listing the candidates instead of an interactive prompt.
 - `Reset-PoshifyTheme` only removes Poshify's own block and warns about other oh-my-posh setup
   instead of editing it. Profile backups are no longer created or restored.
-- Status messages use the verbose/warning streams instead of `Write-Host`.
-
-### Added
-- `Set-PoshifyTheme` applies the theme to the current session (`-NoApply` to skip).
-- `-WhatIf`/`-Confirm` on `Set-`, `Reset-` and `Install-PoshifyTheme`.
-- `Install-PoshifyTheme -Force` and pipeline input (`Find-PoshifyTheme power* | Install-PoshifyTheme`).
-- Tab completion for local theme names.
-- YAML and TOML theme files are recognised.
-- Pester test suite.
+- Status messages use the verbose/warning streams instead of `Write-Host`; no command prompts with
+  `Read-Host` any more.
+- 2.0.0's GitHub rate-limit tracking was removed (it read headers `Invoke-RestMethod` doesn't return);
+  caching keeps requests low and a rate-limit error is reported clearly.
 
 ### Fixed
+- 2.0.0's new commands were missing from `Export-ModuleMember` and could not be called.
+- Adding a second favorite in 2.0.0 merged the names into one string (`agnosteratomic`).
+- 2.0.0's `.gitignore` ignored `*.psd1` and `*.psm1`, the module's own source files.
 - Repeated `Set-PoshifyTheme` calls accumulated `oh-my-posh init` lines in the profile.
 - `Reset-PoshifyTheme` left the theme active, or restored a backup that already contained a theme.
 - `Reset-PoshifyTheme` could leave a broken profile when removing oh-my-posh setup it did not create.
@@ -38,7 +62,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The module failed to resolve its theme folder on Linux and macOS.
 - Profile encoding and line endings are preserved; a missing profile directory is created.
 - Failed downloads no longer leave partial theme files behind.
-- Profiles modified by 1.0.x are cleaned up automatically on the next `Set-` or `Reset-PoshifyTheme`.
+- Profiles modified by 1.0.x or 2.0.0 are cleaned up automatically on the next `Set-` or `Reset-PoshifyTheme`.
 
 ## [1.0.1]
 
@@ -65,7 +89,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Input validation on all parameters
 - Secure web requests for theme downloads
 
-[Unreleased]: https://github.com/tamujin/Poshify/compare/v1.1.0...HEAD
-[1.1.0]: https://github.com/tamujin/Poshify/compare/v1.0.1...v1.1.0
+[Unreleased]: https://github.com/tamujin/Poshify/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/tamujin/Poshify/compare/v1.0.1...v2.1.0
 [1.0.1]: https://github.com/tamujin/Poshify/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/tamujin/Poshify/releases/tag/v1.0.0

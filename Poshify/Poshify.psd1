@@ -1,14 +1,14 @@
 @{
     # Module metadata
     RootModule = 'Poshify.psm1'
-    ModuleVersion = '1.1.0'
+    ModuleVersion = '2.1.0'
     GUID = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
     Author = 'Poshify Module'
     CompanyName = 'Poshify'
     Copyright = '(c) 2024 Poshify Module. All rights reserved.'
     
     # Module description
-    Description = 'A PowerShell module for managing oh-my-posh themes. Provides functions to discover, install, and switch between oh-my-posh themes with ease.'
+    Description = 'A PowerShell module for managing oh-my-posh themes. Discover, install, preview, update and switch between oh-my-posh themes, with favorites and safe profile management.'
     
     # PowerShell version requirements
     PowerShellVersion = '5.1'
@@ -37,10 +37,18 @@
     # Functions to export
     FunctionsToExport = @(
         'Get-PoshifyTheme',
+        'Get-PoshifyCurrentTheme',
         'Find-PoshifyTheme',
         'Install-PoshifyTheme',
+        'Update-PoshifyTheme',
+        'Remove-PoshifyTheme',
         'Set-PoshifyTheme',
         'Reset-PoshifyTheme',
+        'Show-PoshifyTheme',
+        'Get-PoshifyRandomTheme',
+        'Add-PoshifyFavorite',
+        'Remove-PoshifyFavorite',
+        'Get-PoshifyFavorite',
         'Poshify'
     )
     
@@ -50,7 +58,14 @@
         'poshify-theme-find',
         'poshify-theme-install',
         'poshify-theme-set',
-        'poshify-theme-reset'
+        'poshify-theme-reset',
+        'poshify-theme-current',
+        'poshify-theme-remove',
+        'poshify-theme-update',
+        'poshify-theme-show',
+        'poshify-favorite-add',
+        'poshify-favorite-remove',
+        'poshify-favorite-get'
     )
     
     # Cmdlets to export
@@ -85,23 +100,38 @@
             
             # Release notes
             ReleaseNotes = @'
-Version 1.1.0 - Reliable profile handling
-- Profile is managed through one marked block that is written once; switching themes no longer rewrites the profile
+Version 2.1.0
+Upgrading from 1.0.x: your profile is migrated automatically the next time you run
+Set-PoshifyTheme or Reset-PoshifyTheme. (2.0.0 was not published to the Gallery.)
+
+Profile handling
+- The profile is managed through one marked block that is written once; switching themes
+  only updates ~/.poshthemes/current and no longer rewrites the profile
 - Fixed repeated Set-PoshifyTheme calls piling up oh-my-posh init lines in the profile
-- Fixed Reset-PoshifyTheme leaving the theme active and restoring stale profile backups
+- Fixed Reset-PoshifyTheme leaving the theme active or restoring a stale profile backup
 - Reset-PoshifyTheme no longer edits oh-my-posh setup it did not create
-- Blocks written by 1.0.x are migrated automatically
-- Exact theme names take precedence over partial matches; ambiguous names error instead of prompting
-- Themes bundled with oh-my-posh (POSH_THEMES_PATH) are listed and can be set without downloading
-- Set-PoshifyTheme applies the theme to the current session immediately
-- Fixed single search results being dropped on Windows PowerShell 5.1
-- Fixed module path on Linux and macOS
 - Profile encoding and line endings are preserved
-- Added -WhatIf/-Confirm, Install-PoshifyTheme -Force, pipeline input and tab completion
+- Set-PoshifyTheme applies the theme to the current session immediately
+
+New commands
+- Get-PoshifyCurrentTheme: the selected theme
+- Update-PoshifyTheme: re-download themes that changed upstream (-All for every theme)
+- Remove-PoshifyTheme: delete a downloaded theme
+- Show-PoshifyTheme: render a preview of a theme's prompt
+- Get-PoshifyRandomTheme: pick a random (favorite) theme to pipe into Set-PoshifyTheme
+- Add-, Remove-, Get-PoshifyFavorite: manage favorite themes
+- Poshify CLI: theme current/show/update/remove/random and favorite list/add/remove/random
+
+Improvements
+- Themes bundled with oh-my-posh (POSH_THEMES_PATH) are listed and can be set without downloading
+- The online theme list is cached for an hour (Find-PoshifyTheme -ForceRefresh to bypass)
+- Exact theme names take precedence over partial matches; ambiguous names error instead of prompting
+- -WhatIf/-Confirm, pipeline input and tab completion; YAML and TOML themes are recognised
+- Fixed single search results being dropped on Windows PowerShell 5.1
+- Fixed the theme folder location on Linux and macOS
 
 Version 1.0.1 - CI/CD Fix
 - Fixed CI/CD workflow by removing invalid PowerShell setup actions
-- GitHub runners already have PowerShell pre-installed
 
 Version 1.0.0 - Initial Release
 - Get-PoshifyTheme: List available local themes

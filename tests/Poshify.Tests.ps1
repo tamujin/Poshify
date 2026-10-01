@@ -240,14 +240,15 @@ Describe 'Poshify' {
         }
     }
 
+
     Context 'Find-PoshifyTheme' {
         BeforeEach {
             Mock Invoke-RestMethod -ModuleName Poshify {
                 @(
-                    [PSCustomObject]@{ name = 'agnoster.omp.json'; size = 2048; download_url = 'https://example.test/agnoster.omp.json' }
-                    [PSCustomObject]@{ name = 'agnosterplus.omp.json'; size = 2048; download_url = 'https://example.test/agnosterplus.omp.json' }
-                    [PSCustomObject]@{ name = 'atomic.omp.yaml'; size = 1024; download_url = 'https://example.test/atomic.omp.yaml' }
-                    [PSCustomObject]@{ name = 'schema.json'; size = 10; download_url = 'https://example.test/schema.json' }
+                    [PSCustomObject]@{ name = 'agnoster.omp.json'; size = 2048; download_url = 'https://example.test/agnoster.omp.json'; sha = 'a1' }
+                    [PSCustomObject]@{ name = 'agnosterplus.omp.json'; size = 2048; download_url = 'https://example.test/agnosterplus.omp.json'; sha = 'b2' }
+                    [PSCustomObject]@{ name = 'atomic.omp.yaml'; size = 1024; download_url = 'https://example.test/atomic.omp.yaml'; sha = 'c3' }
+                    [PSCustomObject]@{ name = 'schema.json'; size = 10; download_url = 'https://example.test/schema.json'; sha = 'd4' }
                 )
             }
         }
@@ -260,6 +261,38 @@ Describe 'Poshify' {
             $result = @(Find-PoshifyTheme -Name 'atomic')
             $result.Count | Should -Be 1
             $result[0].FileName | Should -Be 'atomic.omp.yaml'
+            $result[0].Sha | Should -Be 'c3'
+        }
+
+        It 'reuses the cached list until -ForceRefresh' {
+            Find-PoshifyTheme | Out-Null
+            $cached = Find-PoshifyTheme
+            Should -Invoke Invoke-RestMethod -ModuleName Poshify -Times 1 -Exactly
+            $cached.Name | Should -Be @('agnoster', 'agnosterplus', 'atomic')
+            $cached[0].PSObject.TypeNames | Should -Contain 'Poshify.OnlineTheme'
+
+            Find-PoshifyTheme -ForceRefresh | Out-Null
+            Should -Invoke Invoke-RestMethod -ModuleName Poshify -Times 2 -Exactly
+        }
+
+        It 'refetches once the cache is older than an hour' {
+            Find-PoshifyTheme | Out-Null
+            $cacheFile = Join-Path $script:home_ '.cache/themes.json'
+            $cache = Get-Content $cacheFile -Raw | ConvertFrom-Json
+            $cache.CachedAt = [datetime]::UtcNow.AddHours(-2).ToString('o')
+            $cache | ConvertTo-Json -Depth 3 | Set-Content $cacheFile
+
+            Find-PoshifyTheme | Out-Null
+            Should -Invoke Invoke-RestMethod -ModuleName Poshify -Times 2 -Exactly
+        }
+
+        It 'falls back to a stale cache when GitHub is unreachable' {
+            Find-PoshifyTheme | Out-Null
+            Mock Invoke-RestMethod -ModuleName Poshify { throw 'No such host is known' }
+
+            $result = Find-PoshifyTheme -ForceRefresh -WarningVariable warnings -WarningAction SilentlyContinue
+            $result.Name | Should -Be @('agnoster', 'agnosterplus', 'atomic')
+            "$warnings" | Should -Match 'cached'
         }
 
         It 'reports GitHub rate limiting clearly' {
@@ -271,9 +304,9 @@ Describe 'Poshify' {
 
     Context 'Install-PoshifyTheme' {
         BeforeEach {
-            Mock Find-PoshifyTheme -ModuleName Poshify {
+            Mock Get-PoshifyOnlineThemeList -ModuleName Poshify {
                 foreach ($name in 'agnoster', 'agnosterplus', 'atomic') {
-                    [PSCustomObject]@{ Name = $name; FileName = "$name.omp.json"; DownloadUrl = "https://example.test/$name.omp.json" }
+                    [PSCustomObject]@{ Name = $name; FileName = "$name.omp.json"; DownloadUrl = "https://example.test/$name.omp.json"; Sha = 'x' }
                 }
             }
             Mock Invoke-WebRequest -ModuleName Poshify { Set-Content -LiteralPath $OutFile -Value '{}' }
@@ -314,8 +347,245 @@ Describe 'Poshify' {
 
         It 'queries GitHub once for piped themes' {
             [PSCustomObject]@{ Name = 'agnoster' }, [PSCustomObject]@{ Name = 'atomic' } | Install-PoshifyTheme
-            Should -Invoke Find-PoshifyTheme -ModuleName Poshify -Times 1 -Exactly
+            Should -Invoke Get-PoshifyOnlineThemeList -ModuleName Poshify -Times 1 -Exactly
             Should -Invoke Invoke-WebRequest -ModuleName Poshify -Times 2 -Exactly
+        }
+    }
+
+    Context 'Update-PoshifyTheme' {
+        BeforeEach {
+            New-ThemeFile -Directory $script:home_ -FileName 'agnoster.omp.json', 'atomic.omp.json', 'retired.omp.json'
+            New-ThemeFile -Directory $script:bundled -FileName 'bundled.omp.json'
+            $script:upToDateSha = InModuleScope Poshify -Parameters @{ Path = (Join-Path $script:home_ 'agnoster.omp.json') } {
+                param($Path)
+                Get-PoshifyGitBlobSha -Path $Path
+            }
+            Mock Get-PoshifyOnlineThemeList -ModuleName Poshify -ParameterFilter { $ForceRefresh } {
+                [PSCustomObject]@{ Name = 'agnoster'; FileName = 'agnoster.omp.json'; DownloadUrl = 'https://example.test/agnoster.omp.json'; Sha = $script:upToDateSha }
+                [PSCustomObject]@{ Name = 'atomic'; FileName = 'atomic.omp.json'; DownloadUrl = 'https://example.test/atomic.omp.json'; Sha = 'changed' }
+            }
+            Mock Invoke-WebRequest -ModuleName Poshify { Set-Content -LiteralPath $OutFile -Value '{"new": true}' }
+        }
+
+        It 'matches git blob hashes reported by GitHub' {
+            # Well-known `git hash-object` result for "hello world\n"
+            $file = Join-Path $TestDrive 'hello.txt'
+            [IO.File]::WriteAllText($file, "hello world`n")
+            InModuleScope Poshify -Parameters @{ Path = $file } {
+                param($Path)
+                Get-PoshifyGitBlobSha -Path $Path
+            } | Should -Be '3b18e512dba79e4c8300dd08aeb37f8e728b8dad'
+        }
+
+        It 'downloads only themes that changed online' {
+            $updated = @(Update-PoshifyTheme -All -WarningAction SilentlyContinue)
+            $updated.Name | Should -Be 'atomic'
+            Get-Content (Join-Path $script:home_ 'atomic.omp.json') -Raw | Should -Match 'new'
+            Get-Content (Join-Path $script:home_ 'agnoster.omp.json') -Raw | Should -Not -Match 'new'
+            Should -Invoke Invoke-WebRequest -ModuleName Poshify -Times 1 -Exactly
+        }
+
+        It 'keeps themes that were removed upstream and warns' {
+            Update-PoshifyTheme -Name 'retired' -WarningVariable warnings -WarningAction SilentlyContinue
+            "$warnings" | Should -Match 'no longer in the oh-my-posh repository'
+            Join-Path $script:home_ 'retired.omp.json' | Should -Exist
+        }
+
+        It 'only updates themes installed by Poshify' {
+            Update-PoshifyTheme -Name 'bundled' -ErrorVariable err -ErrorAction SilentlyContinue
+            "$err" | Should -Match 'installed by Poshify'
+            Should -Invoke Get-PoshifyOnlineThemeList -ModuleName Poshify -Times 0 -Exactly
+        }
+
+        It 'changes nothing with -WhatIf' {
+            Update-PoshifyTheme -Name 'atomic' -WhatIf
+            Should -Invoke Invoke-WebRequest -ModuleName Poshify -Times 0 -Exactly
+        }
+    }
+
+    Context 'Remove-PoshifyTheme' {
+        BeforeEach {
+            New-ThemeFile -Directory $script:home_ -FileName 'agnoster.omp.json', 'agnosterplus.omp.json'
+            New-ThemeFile -Directory $script:bundled -FileName 'atomic.omp.json'
+        }
+
+        It 'removes a downloaded theme' {
+            Remove-PoshifyTheme -Name 'agnoster'
+            Join-Path $script:home_ 'agnoster.omp.json' | Should -Not -Exist
+            Join-Path $script:home_ 'agnosterplus.omp.json' | Should -Exist
+        }
+
+        It 'requires the exact name' {
+            Remove-PoshifyTheme -Name 'plus' -ErrorVariable err -ErrorAction SilentlyContinue
+            "$err" | Should -Match 'exact theme name'
+            Join-Path $script:home_ 'agnosterplus.omp.json' | Should -Exist
+        }
+
+        It 'refuses to remove themes bundled with oh-my-posh' {
+            Remove-PoshifyTheme -Name 'atomic' -ErrorVariable err -ErrorAction SilentlyContinue
+            "$err" | Should -Match 'bundled with oh-my-posh'
+            Join-Path $script:bundled 'atomic.omp.json' | Should -Exist
+        }
+
+        It 'protects the current theme unless -Force is used' {
+            Set-PoshifyTheme -Name 'agnoster' -NoApply
+            Remove-PoshifyTheme -Name 'agnoster' -ErrorVariable err -ErrorAction SilentlyContinue
+            "$err" | Should -Match 'current theme'
+            Join-Path $script:home_ 'agnoster.omp.json' | Should -Exist
+
+            Remove-PoshifyTheme -Name 'agnoster' -Force -WarningAction SilentlyContinue
+            Join-Path $script:home_ 'agnoster.omp.json' | Should -Not -Exist
+        }
+
+        It 'changes nothing with -WhatIf' {
+            Remove-PoshifyTheme -Name 'agnoster' -WhatIf
+            Join-Path $script:home_ 'agnoster.omp.json' | Should -Exist
+        }
+    }
+
+    Context 'Get-PoshifyCurrentTheme' {
+        BeforeEach {
+            New-ThemeFile -Directory $script:bundled -FileName 'agnoster.omp.json'
+            $script:custom = Join-Path $TestDrive 'mine.omp.json'
+            Set-Content -LiteralPath $script:custom -Value '{}'
+        }
+
+        It 'returns nothing when no theme is selected' {
+            Get-PoshifyCurrentTheme | Should -BeNullOrEmpty
+        }
+
+        It 'returns the selected theme' {
+            Set-PoshifyTheme -Name 'agnoster' -NoApply
+            $current = Get-PoshifyCurrentTheme
+            $current.Name | Should -Be 'agnoster'
+            $current.Current | Should -BeTrue
+        }
+
+        It 'reports themes set by path as custom' {
+            Set-PoshifyTheme -ThemePath $script:custom -NoApply
+            $current = Get-PoshifyCurrentTheme
+            $current.Name | Should -Be 'mine'
+            $current.Source | Should -Be 'Custom'
+        }
+
+        It 'warns when the selected file is gone' {
+            Set-PoshifyTheme -ThemePath $script:custom -NoApply
+            [IO.File]::Delete($script:custom)
+
+            Get-PoshifyCurrentTheme -WarningVariable warnings -WarningAction SilentlyContinue | Should -BeNullOrEmpty
+            "$warnings" | Should -Match 'no longer exists'
+        }
+    }
+
+    Context 'Favorites' {
+        BeforeEach {
+            New-ThemeFile -Directory $script:bundled -FileName 'agnoster.omp.json', 'agnosterplus.omp.json', 'atomic.omp.json'
+        }
+
+        It 'keeps a proper list when adding several favorites' {
+            Add-PoshifyFavorite -Name 'agnoster'
+            Add-PoshifyFavorite -Name 'atomic'
+            Add-PoshifyFavorite -Name 'agnoster'
+
+            Get-PoshifyFavorite | Should -Be @('agnoster', 'atomic')
+        }
+
+        It 'stores a single favorite as a JSON list' {
+            Add-PoshifyFavorite -Name 'atomic'
+            (Get-Content (Join-Path $script:home_ '.favorites.json') -Raw).Trim() | Should -Match '^\['
+        }
+
+        It 'stores the exact theme name for a unique partial match' {
+            Add-PoshifyFavorite -Name 'plus'
+            Get-PoshifyFavorite | Should -Be 'agnosterplus'
+        }
+
+        It 'rejects an ambiguous name' {
+            Add-PoshifyFavorite -Name 'agnost' -ErrorVariable err -ErrorAction SilentlyContinue
+            "$err" | Should -Match 'ambiguous'
+            Get-PoshifyFavorite | Should -BeNullOrEmpty
+        }
+
+        It 'accepts themes that are not installed, with a warning' {
+            Add-PoshifyFavorite -Name 'night-owl' -WarningVariable warnings -WarningAction SilentlyContinue
+            Get-PoshifyFavorite | Should -Be 'night-owl'
+            "$warnings" | Should -Match 'not installed'
+        }
+
+        It 'marks favorite themes' {
+            Add-PoshifyFavorite -Name 'atomic'
+            (Get-PoshifyTheme | Where-Object Favorite).Name | Should -Be 'atomic'
+        }
+
+        It 'removes favorites' {
+            Add-PoshifyFavorite -Name 'agnoster'
+            Add-PoshifyFavorite -Name 'atomic'
+            Remove-PoshifyFavorite -Name 'agnoster'
+            Get-PoshifyFavorite | Should -Be 'atomic'
+
+            Remove-PoshifyFavorite -Name 'agnoster' -ErrorVariable err -ErrorAction SilentlyContinue
+            "$err" | Should -Match 'not in favorites'
+        }
+    }
+
+    Context 'Get-PoshifyRandomTheme' {
+        BeforeEach {
+            New-ThemeFile -Directory $script:bundled -FileName 'agnoster.omp.json', 'atomic.omp.json', 'paradox.omp.json'
+        }
+
+        It 'never picks the current theme when there is another choice' {
+            Set-PoshifyTheme -Name 'agnoster' -NoApply
+            1..20 | ForEach-Object { (Get-PoshifyRandomTheme).Name } | Should -Not -Contain 'agnoster'
+        }
+
+        It 'picks only from favorites that are installed' {
+            Add-PoshifyFavorite -Name 'paradox'
+            Add-PoshifyFavorite -Name 'night-owl' -WarningAction SilentlyContinue
+            1..10 | ForEach-Object { (Get-PoshifyRandomTheme -FromFavorites).Name } | Should -Be (@('paradox') * 10)
+        }
+
+        It 'errors when there are no favorites' {
+            Get-PoshifyRandomTheme -FromFavorites -ErrorVariable err -ErrorAction SilentlyContinue | Should -BeNullOrEmpty
+            "$err" | Should -Match 'favorite'
+        }
+
+        It 'does not change the theme by itself' {
+            Get-PoshifyRandomTheme | Out-Null
+            Join-Path $script:home_ 'current' | Should -Not -Exist
+        }
+
+        It 'can be piped into Set-PoshifyTheme' {
+            $theme = Get-PoshifyRandomTheme
+            $theme | Set-PoshifyTheme -NoApply
+            (Get-PoshifyCurrentTheme).Name | Should -Be $theme.Name
+        }
+    }
+
+    Context 'Show-PoshifyTheme' {
+        BeforeEach {
+            New-ThemeFile -Directory $script:bundled -FileName 'agnoster.omp.json'
+            Mock Invoke-OhMyPosh -ModuleName Poshify { "oh-my-posh $ArgumentList" }
+        }
+
+        It 'renders a preview with oh-my-posh without changing the theme' {
+            $output = Show-PoshifyTheme -Name 'agnoster'
+            $output[0] | Should -Be '== agnoster =='
+            $output[1] | Should -BeLike 'oh-my-posh print preview --config *agnoster.omp.json'
+            Join-Path $script:home_ 'current' | Should -Not -Exist
+        }
+
+        It 'accepts themes from the pipeline' {
+            (Get-PoshifyTheme | Show-PoshifyTheme)[0] | Should -Be '== agnoster =='
+        }
+    }
+
+    Context 'Module surface' {
+        It 'exports every command listed in the manifest' {
+            $manifest = Import-PowerShellDataFile (Join-Path $PSScriptRoot '../Poshify/Poshify.psd1')
+            $exported = (Get-Command -Module Poshify).Name
+            foreach ($name in @($manifest.FunctionsToExport) + @($manifest.AliasesToExport)) {
+                $exported | Should -Contain $name
+            }
         }
     }
 }
