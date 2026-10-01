@@ -11,7 +11,7 @@ A powerful PowerShell module for managing Oh My Posh themes with ease. Discover,
 - 🔍 **Discover Themes**: Browse hundreds of Oh My Posh themes from the official repository
 - 📥 **Easy Installation**: Download and install themes with a single command
 - 🔄 **Quick Switching**: Seamlessly switch between installed themes
-- 💾 **Profile Management**: Automatic PowerShell profile backup and restoration
+- 💾 **Safe Profile Management**: One clearly marked profile block; the rest of your profile is never touched
 - 🎯 **CLI Interface**: Simple command-line interface for all operations
 - 🔧 **Zero Configuration**: Works out of the box with sensible defaults
 
@@ -49,11 +49,13 @@ Poshify theme reset
 ## 📖 Commands
 
 ### Get-PoshifyTheme
-List all locally installed themes.
+List local themes: ones downloaded by Poshify plus the themes bundled with oh-my-posh
+(`$env:POSH_THEMES_PATH`). An exact name match wins over partial matches.
 
 ```powershell
 Get-PoshifyTheme
 Get-PoshifyTheme -Name "agnoster"
+Get-PoshifyTheme | Where-Object Current   # the selected theme
 ```
 
 ### Find-PoshifyTheme
@@ -69,19 +71,24 @@ Download and install a theme from the official repository.
 
 ```powershell
 Install-PoshifyTheme -Name "agnoster"
-Install-PoshifyTheme -Name "powerlevel10k_rainbow"
+Install-PoshifyTheme -Name "powerlevel10k_rainbow" -Force   # re-download
+Find-PoshifyTheme "power*" | Install-PoshifyTheme
 ```
 
 ### Set-PoshifyTheme
-Apply a theme to your PowerShell prompt.
+Apply a theme to your PowerShell prompt, in the current session and future ones.
+Theme names tab-complete.
 
 ```powershell
 Set-PoshifyTheme -Name "agnoster"
 Set-PoshifyTheme -ThemePath "C:\path\to\custom.omp.json"
+Get-PoshifyTheme | Get-Random | Set-PoshifyTheme
+Set-PoshifyTheme agnoster -WhatIf
 ```
 
 ### Reset-PoshifyTheme
-Remove Oh My Posh configuration and restore default PowerShell prompt.
+Remove Poshify's block from your profile and restore the default PowerShell prompt.
+Any oh-my-posh setup Poshify didn't create is left alone and reported as a warning.
 
 ```powershell
 Reset-PoshifyTheme
@@ -98,15 +105,32 @@ Poshify theme set <name>
 Poshify theme reset
 ```
 
-## 📁 File Structure
+## 📁 How It Works
+
+The first `Set-PoshifyTheme` adds this block to your profile (`$PROFILE.CurrentUserAllHosts`).
+It is only written once; you can move it anywhere in the profile and Poshify will keep it there.
+
+```powershell
+# >>> poshify >>>
+$poshifyTheme = Get-Content -LiteralPath '~/.poshthemes/current' -TotalCount 1 -ErrorAction SilentlyContinue
+if ($poshifyTheme -and (Test-Path -LiteralPath $poshifyTheme) -and (Get-Command oh-my-posh -ErrorAction SilentlyContinue)) {
+    oh-my-posh init pwsh --config $poshifyTheme | Invoke-Expression
+}
+# <<< poshify <<<
+```
+
+Switching themes only changes the selection file:
 
 ```
-%USERPROFILE%\.poshthemes\
-├── agnoster.omp.json
-├── powerlevel10k_rainbow.omp.json
-├── .profile_backup          # Backup of original PowerShell profile
-└── ... (other theme files)
+~/.poshthemes/
+├── current                          # Path of the selected theme
+├── agnoster.omp.json                # Themes downloaded by Install-PoshifyTheme
+└── powerlevel10k_rainbow.omp.json
 ```
+
+Upgrading from 1.0.x? The old unmarked profile entries are cleaned up automatically the next time
+you run `Set-PoshifyTheme` or `Reset-PoshifyTheme`. The old `~/.poshthemes/.profile_backup` file
+is no longer used and can be deleted.
 
 ## 🔧 Requirements
 
@@ -131,10 +155,13 @@ Import-Module .\Poshify\Poshify.psd1 -Force
 ### Running Tests
 
 ```powershell
-# Run PSScriptAnalyzer
-Invoke-ScriptAnalyzer -Path .\Poshify -Settings PSGallery
+# Unit tests (Pester 5+); they never touch your real profile or the network
+Invoke-Pester -Path .\tests
 
-# Test module functions
+# Run PSScriptAnalyzer
+Invoke-ScriptAnalyzer -Path .\Poshify -Settings PSGallery -Recurse
+
+# Validate the manifest
 Test-ModuleManifest -Path .\Poshify\Poshify.psd1
 ```
 

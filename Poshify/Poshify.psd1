@@ -1,7 +1,7 @@
 @{
     # Module metadata
     RootModule = 'Poshify.psm1'
-    ModuleVersion = '1.0.0'
+    ModuleVersion = '1.1.0'
     GUID = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
     Author = 'Poshify Module'
     CompanyName = 'Poshify'
@@ -12,6 +12,9 @@
     
     # PowerShell version requirements
     PowerShellVersion = '5.1'
+    
+    # Supported editions
+    CompatiblePSEditions = @('Desktop', 'Core')
     
     # Required modules
     RequiredModules = @()
@@ -82,6 +85,24 @@
             
             # Release notes
             ReleaseNotes = @'
+Version 1.1.0 - Reliable profile handling
+- Profile is managed through one marked block that is written once; switching themes no longer rewrites the profile
+- Fixed repeated Set-PoshifyTheme calls piling up oh-my-posh init lines in the profile
+- Fixed Reset-PoshifyTheme leaving the theme active and restoring stale profile backups
+- Reset-PoshifyTheme no longer edits oh-my-posh setup it did not create
+- Blocks written by 1.0.x are migrated automatically
+- Exact theme names take precedence over partial matches; ambiguous names error instead of prompting
+- Themes bundled with oh-my-posh (POSH_THEMES_PATH) are listed and can be set without downloading
+- Set-PoshifyTheme applies the theme to the current session immediately
+- Fixed single search results being dropped on Windows PowerShell 5.1
+- Fixed module path on Linux and macOS
+- Profile encoding and line endings are preserved
+- Added -WhatIf/-Confirm, Install-PoshifyTheme -Force, pipeline input and tab completion
+
+Version 1.0.1 - CI/CD Fix
+- Fixed CI/CD workflow by removing invalid PowerShell setup actions
+- GitHub runners already have PowerShell pre-installed
+
 Version 1.0.0 - Initial Release
 - Get-PoshifyTheme: List available local themes
 - Find-PoshifyTheme: Discover themes from oh-my-posh repository

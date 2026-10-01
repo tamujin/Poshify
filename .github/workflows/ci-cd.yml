@@ -9,80 +9,92 @@ on:
     types: [ published ]
 
 jobs:
-  test:
-    name: Test PowerShell Module
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    
+  lint:
+    name: Lint and Validate Manifest
+    runs-on: ubuntu-latest
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-    
+
     - name: Install PSScriptAnalyzer
       shell: pwsh
       run: |
-        Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser
-    
+        Install-PSResource -Name PSScriptAnalyzer -Scope CurrentUser -TrustRepository
+
     - name: Run PSScriptAnalyzer
       shell: pwsh
       run: |
-        $results = Invoke-ScriptAnalyzer -Path .\Poshify -Settings PSGallery -Recurse
+        $results = Invoke-ScriptAnalyzer -Path ./Poshify -Settings PSGallery -Recurse
         if ($results) {
           $results | Format-Table -AutoSize
           exit 1
         }
-    
+
     - name: Test Module Manifest
       shell: pwsh
       run: |
-        Test-ModuleManifest -Path .\Poshify\Poshify.psd1
-    
-    - name: Import Module Test
-      shell: pwsh
-      run: |
-        Import-Module .\Poshify\Poshify.psd1 -Force
-        Get-Command -Module Poshify | Format-Table -AutoSize
-    
-    - name: Test Basic Functionality
-      shell: pwsh
-      run: |
-        Import-Module .\Poshify\Poshify.psd1 -Force
-        # Test help functionality
-        Get-Help Get-PoshifyTheme -ErrorAction Stop
-        Get-Help Find-PoshifyTheme -ErrorAction Stop
-        Get-Help Install-PoshifyTheme -ErrorAction Stop
-        Get-Help Set-PoshifyTheme -ErrorAction Stop
-        Get-Help Reset-PoshifyTheme -ErrorAction Stop
-        Get-Help Poshify -ErrorAction Stop
+        Test-ModuleManifest -Path ./Poshify/Poshify.psd1
 
-  build:
-    name: Build Module
-    needs: test
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push' || github.event_name == 'release'
-    
+  test:
+    name: Test (${{ matrix.os }}, ${{ matrix.shell }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        shell: [pwsh]
+        include:
+          - os: windows-latest
+            shell: powershell
+
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-    
+
+    - name: Install Pester
+      run: |
+        Install-Module -Name Pester -MinimumVersion 5.5.0 -Force -SkipPublisherCheck -Scope CurrentUser
+
+    - name: Run Pester tests
+      run: |
+        Import-Module Pester -MinimumVersion 5.5.0
+        $config = New-PesterConfiguration
+        $config.Run.Path = './tests'
+        $config.Run.Exit = $true
+        $config.Output.Verbosity = 'Detailed'
+        Invoke-Pester -Configuration $config
+
+  build:
+    name: Build Module
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'release'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
     - name: Create Module Package
       shell: pwsh
       run: |
         # Create build directory
-        New-Item -ItemType Directory -Path .\build -Force
-        
+        New-Item -ItemType Directory -Path ./build -Force
+
         # Copy module files
-        Copy-Item -Path .\Poshify -Destination .\build -Recurse -Force
-        
+        Copy-Item -Path ./Poshify -Destination ./build -Recurse -Force
+
         # Create version info
-        $manifest = Test-ModuleManifest -Path .\build\Poshify\Poshify.psd1
-        "Module Version: $($manifest.Version)" | Out-File -FilePath .\build\version.txt
-        
+        $manifest = Test-ModuleManifest -Path ./build/Poshify/Poshify.psd1
+        "Module Version: $($manifest.Version)" | Out-File -FilePath ./build/version.txt
+
         # Create zip package
-        Compress-Archive -Path .\build\Poshify -DestinationPath .\Poshify.zip -Force
-    
+        Compress-Archive -Path ./build/Poshify -DestinationPath ./Poshify.zip -Force
+
     - name: Upload Build Artifacts
       uses: actions/upload-artifact@v4
       with:
@@ -96,18 +108,14 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     if: github.event_name == 'release'
-    
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-    
+
     - name: Publish Module
       shell: pwsh
       run: |
-        # Install NuGet provider
-        Install-PackageProvider -Name NuGet -Force -Scope CurrentUser
-        
-        # Publish to PowerShell Gallery
-        Publish-Module -Path .\Poshify -NuGetApiKey ${{ secrets.PSGALLERY_API_KEY }} -Force
+        Publish-PSResource -Path ./Poshify -Repository PSGallery -ApiKey $env:PSGALLERY_API_KEY
       env:
         PSGALLERY_API_KEY: ${{ secrets.PSGALLERY_API_KEY }}

@@ -3,25 +3,203 @@
     Poshify - A PowerShell module for managing oh-my-posh themes
 
 .DESCRIPTION
-    This module provides functions to manage oh-my-posh themes including listing,
-    installing, and switching between themes.
+    This module provides functions to list, install, and switch between oh-my-posh themes.
 
-.NOTES
-    Author: Poshify Module
-    Version: 1.0.0
+    Poshify adds a single marked block to your PowerShell profile that loads whichever theme
+    is currently selected. Switching themes only changes that selection, so the rest of your
+    profile is never rewritten.
 #>
 
 # Module variables
-$script:PoshifyThemesPath = Join-Path $env:USERPROFILE ".poshthemes"
-$script:OhMyPoshGitHubThemesUrl = "https://api.github.com/repos/JanDeDobbeleer/oh-my-posh/contents/themes"
-$script:ProfileBackupPath = Join-Path $env:USERPROFILE ".poshthemes\.profile_backup"
+$script:PoshifyHome = Join-Path $HOME '.poshthemes'
+$script:OhMyPoshGitHubThemesUrl = 'https://api.github.com/repos/JanDeDobbeleer/oh-my-posh/contents/themes'
+$script:ThemeFilePattern = '\.omp\.(json|ya?ml|toml)$'
+$script:ProfileBlockStart = '# >>> poshify >>>'
+$script:ProfileBlockEnd = '# <<< poshify <<<'
+
+#region Private helpers
+
+function Get-PoshifyProfilePath {
+    $PROFILE.CurrentUserAllHosts
+}
+
+function Get-OhMyPoshCommand {
+    Get-Command -Name oh-my-posh -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+}
+
+# File that holds the full path of the selected theme; read by the profile block at startup
+function Get-PoshifyCurrentThemeFile {
+    Join-Path $script:PoshifyHome 'current'
+}
+
+function Get-PoshifyCurrentThemePath {
+    $file = Get-PoshifyCurrentThemeFile
+    if (Test-Path -LiteralPath $file) {
+        Get-Content -LiteralPath $file -TotalCount 1
+    }
+}
+
+function Get-PoshifyThemeName {
+    param([string]$FileName)
+    $FileName -replace $script:ThemeFilePattern, ''
+}
+
+# Directories searched for themes, in priority order. Themes downloaded by Poshify shadow
+# the ones bundled with oh-my-posh (POSH_THEMES_PATH), which may not exist on every install.
+function Get-PoshifyThemeSource {
+    [PSCustomObject]@{ Name = 'Poshify'; Path = $script:PoshifyHome }
+    if ($env:POSH_THEMES_PATH) {
+        [PSCustomObject]@{ Name = 'oh-my-posh'; Path = $env:POSH_THEMES_PATH }
+    }
+}
+
+# Exact name match wins; otherwise wildcards are honoured and plain text is a substring search
+function Select-PoshifyThemeMatch {
+    param(
+        [object[]]$Theme,
+        [string]$Name
+    )
+
+    $exact = @($Theme | Where-Object { $_.Name -eq $Name })
+    if ($exact.Count -gt 0) {
+        return $exact
+    }
+
+    $pattern = if ([WildcardPattern]::ContainsWildcardCharacters($Name)) { $Name } else { "*$Name*" }
+    @($Theme | Where-Object { $_.Name -like $pattern })
+}
+
+function Resolve-PoshifySingleTheme {
+    param(
+        [object[]]$Match,
+        [string]$Name,
+        [string]$Location
+    )
+
+    if ($Match.Count -eq 1) {
+        return $Match[0]
+    }
+
+    if ($Match.Count -eq 0) {
+        Write-Error -Message "Theme '$Name' not found $Location." -Category ObjectNotFound -TargetObject $Name
+        return
+    }
+
+    $names = ($Match | Select-Object -First 10 -ExpandProperty Name) -join ', '
+    if ($Match.Count -gt 10) {
+        $names += ", ... ($($Match.Count) total)"
+    }
+    Write-Error -Message "Theme name '$Name' is ambiguous $Location. Matches: $names" -Category InvalidArgument -TargetObject $Name
+}
+
+# Reads a text file keeping its encoding, so rewriting a profile never mangles non-ASCII text.
+# Windows PowerShell treats BOM-less files as ANSI, so non-UTF-8 content falls back to that.
+function Read-PoshifyTextFile {
+    param([string]$Path)
+
+    $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
+    $reader = New-Object System.IO.StreamReader($Path, $strictUtf8, $true)
+    try {
+        $text = $reader.ReadToEnd()
+        $encoding = $reader.CurrentEncoding
+    }
+    catch [System.Text.DecoderFallbackException] {
+        $encoding = [System.Text.Encoding]::GetEncoding([Globalization.CultureInfo]::CurrentCulture.TextInfo.ANSICodePage)
+        $text = [System.IO.File]::ReadAllText($Path, $encoding)
+    }
+    finally {
+        $reader.Dispose()
+    }
+
+    [PSCustomObject]@{ Text = $text; Encoding = $encoding }
+}
+
+function Write-PoshifyTextFile {
+    param(
+        [string]$Path,
+        [string]$Text,
+        # UTF-8 with BOM is read correctly by both Windows PowerShell and PowerShell 7
+        [System.Text.Encoding]$Encoding = (New-Object System.Text.UTF8Encoding($true))
+    )
+
+    $directory = Split-Path -Path $Path -Parent
+    if ($directory -and -not (Test-Path -LiteralPath $directory)) {
+        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    }
+    [System.IO.File]::WriteAllText($Path, $Text, $Encoding)
+}
+
+function Get-PoshifyProfileBlock {
+    param([string]$NewLine)
+
+    $pointer = (Get-PoshifyCurrentThemeFile) -replace "'", "''"
+    @(
+        $script:ProfileBlockStart
+        '# Managed by Poshify - use Set-PoshifyTheme / Reset-PoshifyTheme instead of editing this block.'
+        "`$poshifyTheme = Get-Content -LiteralPath '$pointer' -TotalCount 1 -ErrorAction SilentlyContinue"
+        'if ($poshifyTheme -and (Test-Path -LiteralPath $poshifyTheme) -and (Get-Command oh-my-posh -ErrorAction SilentlyContinue)) {'
+        '    oh-my-posh init pwsh --config $poshifyTheme | Invoke-Expression'
+        '}'
+        'Remove-Variable -Name poshifyTheme -ErrorAction SilentlyContinue'
+        $script:ProfileBlockEnd
+    ) -join $NewLine
+}
+
+# Returns profile text with the Poshify block replaced in place (or appended), or removed with -Remove.
+# Also cleans up the unmarked blocks written by Poshify 1.0.x, including the partial leftovers
+# that its broken cleanup regex used to leave behind.
+function Merge-PoshifyProfileBlock {
+    param(
+        [AllowEmptyString()]
+        [string]$Content,
+        [switch]$Remove
+    )
+
+    $newLine = if ($Content -match "`r`n") { "`r`n" } elseif ($Content -match "`n") { "`n" } else { [Environment]::NewLine }
+    $markedPattern = '(?ms)^{0}[ \t]*\r?$.*?^{1}[ \t]*(\r?\n)?' -f [regex]::Escape($script:ProfileBlockStart), [regex]::Escape($script:ProfileBlockEnd)
+    $legacyPattern = '(?m)^(?:# Poshify Theme - Generated by Poshify Module\r?\n)?# Theme: .*\r?\n# Generated on: .*\r?\n(?:[ \t]*\r?\n)*oh-my-posh init pwsh --config ".*" \| Invoke-Expression[ \t]*(?:\r?\n)?'
+
+    $result = $Content -replace $legacyPattern, ''
+
+    if ($Remove) {
+        $result = $result -replace $markedPattern, ''
+    }
+    else {
+        $block = (Get-PoshifyProfileBlock -NewLine $newLine) + $newLine
+        $marked = [regex]::new($markedPattern)
+        $existing = $marked.Match($result)
+        if ($existing.Success) {
+            # Keep the block where the user put it; drop any duplicates after it
+            $rest = $marked.Replace($result.Substring($existing.Index + $existing.Length), '')
+            $result = $result.Substring(0, $existing.Index) + $block + $rest
+        }
+        else {
+            $result = $result.TrimEnd()
+            $result = if ($result) { $result + $newLine + $newLine + $block } else { $block }
+        }
+    }
+
+    if ($result -cne $Content) {
+        $result = $result.TrimEnd()
+        if ($result) { $result += $newLine }
+    }
+    $result
+}
+
+#endregion
 
 <#
 .SYNOPSIS
     Gets available local oh-my-posh themes
 
 .DESCRIPTION
-    Lists all oh-my-posh theme files available in the local themes directory
+    Lists oh-my-posh theme files downloaded by Poshify (~/.poshthemes) and the themes bundled
+    with oh-my-posh ($env:POSH_THEMES_PATH). A theme downloaded by Poshify takes precedence
+    over a bundled theme with the same name.
+
+.PARAMETER Name
+    Theme name to look up. An exact match is returned if one exists; otherwise the name is
+    treated as a wildcard pattern, or as a substring if it contains no wildcard characters.
 
 .EXAMPLE
     Get-PoshifyTheme
@@ -29,50 +207,60 @@ $script:ProfileBackupPath = Join-Path $env:USERPROFILE ".poshthemes\.profile_bac
 
 .EXAMPLE
     Get-PoshifyTheme -Name "agnoster"
-    Gets information about a specific theme
+    Gets the agnoster theme
+
+.EXAMPLE
+    Get-PoshifyTheme | Where-Object Current
+    Shows the currently selected theme
 
 .OUTPUTS
-    System.IO.FileInfo[]
+    Poshify.Theme
 #>
 function Get-PoshifyTheme {
     [CmdletBinding()]
+    [OutputType('Poshify.Theme')]
     param(
         [Parameter(Position = 0)]
         [string]$Name
     )
 
-    try {
-        # Ensure themes directory exists
-        if (-not (Test-Path $script:PoshifyThemesPath)) {
-            Write-Warning "Themes directory not found at: $script:PoshifyThemesPath"
-            Write-Host "Creating themes directory..." -ForegroundColor Yellow
-            New-Item -ItemType Directory -Path $script:PoshifyThemesPath -Force | Out-Null
+    $currentPath = Get-PoshifyCurrentThemePath
+    $seen = @{}
+
+    $themes = foreach ($source in Get-PoshifyThemeSource) {
+        if (-not (Test-Path -LiteralPath $source.Path)) {
+            Write-Verbose "Theme directory not found: $($source.Path)"
+            continue
         }
 
-        # Get theme files
-        $themeFiles = Get-ChildItem -Path $script:PoshifyThemesPath -Filter "*.omp.json" -ErrorAction SilentlyContinue
+        Get-ChildItem -LiteralPath $source.Path -File |
+            Where-Object { $_.Name -match $script:ThemeFilePattern } |
+            ForEach-Object {
+                $themeName = Get-PoshifyThemeName $_.Name
+                if ($seen.ContainsKey($themeName)) { return }
+                $seen[$themeName] = $true
 
-        if ($Name) {
-            $theme = $themeFiles | Where-Object { $_.BaseName -like "*$Name*" }
-            if (-not $theme) {
-                Write-Error "Theme '$Name' not found in local themes directory"
-                return
+                [PSCustomObject]@{
+                    PSTypeName = 'Poshify.Theme'
+                    Name       = $themeName
+                    Source     = $source.Name
+                    Current    = $_.FullName -eq $currentPath
+                    Path       = $_.FullName
+                }
             }
-            return $theme
-        }
-
-        if ($themeFiles.Count -eq 0) {
-            Write-Host "No themes found in: $script:PoshifyThemesPath" -ForegroundColor Yellow
-            Write-Host "Use Find-PoshifyTheme to discover and Install-PoshifyTheme to download themes" -ForegroundColor Cyan
-            return
-        }
-
-        Write-Host "Available local themes:" -ForegroundColor Green
-        return $themeFiles
     }
-    catch {
-        Write-Error "Failed to get themes: $($_.Exception.Message)"
+    $themes = @($themes | Sort-Object -Property Name)
+
+    if (-not $Name) {
+        return $themes
     }
+
+    $found = Select-PoshifyThemeMatch -Theme $themes -Name $Name
+    if (-not $found) {
+        Write-Error -Message "Theme '$Name' not found locally. Use Find-PoshifyTheme to search online." -Category ObjectNotFound -TargetObject $Name
+        return
+    }
+    $found
 }
 
 <#
@@ -80,7 +268,11 @@ function Get-PoshifyTheme {
     Finds oh-my-posh themes available online
 
 .DESCRIPTION
-    Lists all oh-my-posh themes available in the official GitHub repository
+    Lists the oh-my-posh themes available in the official GitHub repository.
+    Uses the GitHub API, which allows 60 unauthenticated requests per hour.
+
+.PARAMETER Name
+    Theme name to search for. Exact match first, then wildcard or substring match.
 
 .EXAMPLE
     Find-PoshifyTheme
@@ -90,48 +282,54 @@ function Get-PoshifyTheme {
     Find-PoshifyTheme -Name "agnoster"
     Searches for themes containing "agnoster" in their name
 
+.EXAMPLE
+    Find-PoshifyTheme -Name "power*" | Install-PoshifyTheme
+    Installs every theme whose name starts with "power"
+
 .OUTPUTS
-    PSCustomObject[]
+    Poshify.OnlineTheme
 #>
 function Find-PoshifyTheme {
     [CmdletBinding()]
+    [OutputType('Poshify.OnlineTheme')]
     param(
         [Parameter(Position = 0)]
         [string]$Name
     )
 
+    Write-Verbose "Fetching theme list from $script:OhMyPoshGitHubThemesUrl"
     try {
-        Write-Host "Fetching available themes from oh-my-posh GitHub repository..." -ForegroundColor Cyan
-        
-        # Fetch themes from GitHub API
         $response = Invoke-RestMethod -Uri $script:OhMyPoshGitHubThemesUrl -Method Get -ErrorAction Stop
-        
-        # Filter for JSON theme files
-        $themes = $response | Where-Object { $_.name -like "*.omp.json" } | ForEach-Object {
-            [PSCustomObject]@{
-                Name = $_.name -replace '\.omp\.json$', ''
-                FileName = $_.name
-                DownloadUrl = $_.download_url
-                Size = [math]::Round($_.size / 1KB, 2)
-                LastModified = $_.git_url
-            }
-        }
-
-        if ($Name) {
-            $themes = $themes | Where-Object { $_.Name -like "*$Name*" }
-            if ($themes.Count -eq 0) {
-                Write-Warning "No themes found matching '$Name'"
-                return
-            }
-        }
-
-        Write-Host "Found $($themes.Count) themes available online:" -ForegroundColor Green
-        return $themes
     }
     catch {
-        Write-Error "Failed to fetch themes from GitHub: $($_.Exception.Message)"
-        Write-Host "Make sure you have internet connectivity and GitHub is accessible" -ForegroundColor Yellow
+        $message = "Failed to fetch themes from GitHub: $($_.Exception.Message)"
+        if ("$($_.ErrorDetails.Message) $($_.Exception.Message)" -match 'rate limit') {
+            $message = 'GitHub API rate limit reached (60 requests per hour without authentication). Try again later.'
+        }
+        Write-Error -Message $message -Exception $_.Exception -Category ConnectionError
+        return
     }
+
+    $themes = @($response | Where-Object { $_.name -match $script:ThemeFilePattern } | ForEach-Object {
+            [PSCustomObject]@{
+                PSTypeName  = 'Poshify.OnlineTheme'
+                Name        = Get-PoshifyThemeName $_.name
+                FileName    = $_.name
+                SizeKB      = [math]::Round($_.size / 1KB, 2)
+                DownloadUrl = $_.download_url
+            }
+        })
+
+    if (-not $Name) {
+        return $themes
+    }
+
+    $found = Select-PoshifyThemeMatch -Theme $themes -Name $Name
+    if (-not $found) {
+        Write-Warning "No online themes found matching '$Name'"
+        return
+    }
+    $found
 }
 
 <#
@@ -139,81 +337,86 @@ function Find-PoshifyTheme {
     Installs an oh-my-posh theme
 
 .DESCRIPTION
-    Downloads and saves a theme from the official oh-my-posh repository
+    Downloads a theme from the official oh-my-posh repository into ~/.poshthemes.
+    If the theme is already available locally (including themes bundled with oh-my-posh),
+    the local theme is returned instead unless -Force is used.
 
 .PARAMETER Name
-    The name of the theme to install
+    The name of the theme to install. Must match exactly one online theme.
+
+.PARAMETER Force
+    Download the theme even if it is already available locally, overwriting any previous download.
 
 .EXAMPLE
     Install-PoshifyTheme -Name "agnoster"
     Downloads and installs the agnoster theme
 
 .EXAMPLE
-    Install-PoshifyTheme -Name "powerlevel10k_rainbow"
-    Downloads and installs the powerlevel10k_rainbow theme
+    Install-PoshifyTheme -Name "powerlevel10k_rainbow" -Force
+    Downloads the theme again, replacing the local copy
 
 .OUTPUTS
-    System.IO.FileInfo
+    Poshify.Theme
 #>
 function Install-PoshifyTheme {
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType('Poshify.Theme')]
     param(
-        [Parameter(Mandatory = $true, Position = 0)]
-        [string]$Name
+        [Parameter(Mandatory = $true, Position = 0, ValueFromPipelineByPropertyName = $true)]
+        [string]$Name,
+
+        [switch]$Force
     )
 
-    try {
-        # Ensure themes directory exists
-        if (-not (Test-Path $script:PoshifyThemesPath)) {
-            New-Item -ItemType Directory -Path $script:PoshifyThemesPath -Force | Out-Null
+    begin {
+        $onlineThemes = $null
+    }
+
+    process {
+        if (-not $Force) {
+            $existing = @(Get-PoshifyTheme | Where-Object { $_.Name -eq $Name })
+            if ($existing.Count -gt 0) {
+                Write-Warning "Theme '$Name' is already available locally ($($existing[0].Source)). Use -Force to download it again."
+                return $existing[0]
+            }
         }
 
-        # Check if theme already exists locally
-        $existingTheme = Get-ChildItem -Path $script:PoshifyThemesPath -Filter "*$Name*.omp.json" -ErrorAction SilentlyContinue
-        if ($existingTheme) {
-            Write-Warning "Theme '$Name' already exists locally"
-            Write-Host "Use Get-PoshifyTheme to see all local themes" -ForegroundColor Yellow
-            return $existingTheme
+        # Fetch the online list once per pipeline, not once per piped theme
+        if ($null -eq $onlineThemes) {
+            $onlineThemes = @(Find-PoshifyTheme)
         }
-
-        Write-Host "Searching for theme '$Name' online..." -ForegroundColor Cyan
-        
-        # Find the theme online
-        $onlineThemes = Find-PoshifyTheme -Name $Name
-        if (-not $onlineThemes) {
-            Write-Error "Theme '$Name' not found online"
+        if ($onlineThemes.Count -eq 0) {
             return
         }
 
-        # If multiple matches, let user choose
-        $selectedTheme = if ($onlineThemes.Count -gt 1) {
-            Write-Host "Multiple themes found matching '$Name':" -ForegroundColor Yellow
-            for ($i = 0; $i -lt $onlineThemes.Count; $i++) {
-                Write-Host "  [$i] $($onlineThemes[$i].Name)" -ForegroundColor Cyan
-            }
-            $choice = Read-Host "Select theme number (0-$($onlineThemes.Count-1))"
-            $onlineThemes[$choice]
-        } else {
-            $onlineThemes[0]
+        $theme = Resolve-PoshifySingleTheme -Match (Select-PoshifyThemeMatch -Theme $onlineThemes -Name $Name) -Name $Name -Location 'online'
+        if (-not $theme) {
+            return
         }
 
-        # Download the theme
-        Write-Host "Downloading theme '$($selectedTheme.Name)'..." -ForegroundColor Green
-        $themePath = Join-Path $script:PoshifyThemesPath $selectedTheme.FileName
-        
-        Invoke-WebRequest -Uri $selectedTheme.DownloadUrl -OutFile $themePath -ErrorAction Stop
-        
-        if (Test-Path $themePath) {
-            Write-Host "Theme '$($selectedTheme.Name)' installed successfully!" -ForegroundColor Green
-            Write-Host "Theme location: $themePath" -ForegroundColor Cyan
-            return Get-Item $themePath
-        } else {
-            Write-Error "Theme download failed - file not found after download"
+        $themePath = Join-Path $script:PoshifyHome $theme.FileName
+        if (-not $PSCmdlet.ShouldProcess($themePath, "Download theme '$($theme.Name)'")) {
+            return
         }
-    }
-    catch {
-        Write-Error "Failed to install theme '$Name': $($_.Exception.Message)"
-        Write-Host "Make sure you have internet connectivity and the theme name is correct" -ForegroundColor Yellow
+
+        if (-not (Test-Path -LiteralPath $script:PoshifyHome)) {
+            New-Item -ItemType Directory -Path $script:PoshifyHome -Force | Out-Null
+        }
+
+        # Download to a temporary name so a failed download never leaves a broken theme behind
+        $downloadPath = "$themePath.download"
+        try {
+            Invoke-WebRequest -Uri $theme.DownloadUrl -OutFile $downloadPath -UseBasicParsing -ErrorAction Stop
+            Move-Item -LiteralPath $downloadPath -Destination $themePath -Force
+        }
+        catch {
+            Remove-Item -LiteralPath $downloadPath -Force -ErrorAction SilentlyContinue
+            Write-Error -Message "Failed to download theme '$($theme.Name)': $($_.Exception.Message)" -Exception $_.Exception -Category ConnectionError
+            return
+        }
+
+        Write-Verbose "Theme '$($theme.Name)' installed to $themePath"
+        Get-PoshifyTheme | Where-Object { $_.Path -eq $themePath }
     }
 }
 
@@ -222,13 +425,20 @@ function Install-PoshifyTheme {
     Sets the current oh-my-posh theme
 
 .DESCRIPTION
-    Applies a theme by updating the user's PowerShell profile and calling oh-my-posh init
+    Selects a theme, makes sure your PowerShell profile contains the Poshify block that loads the
+    selected theme at startup, and applies the theme to the current session.
+
+    The profile block is written once and kept where it is; switching themes afterwards only
+    changes the selection stored in ~/.poshthemes/current.
 
 .PARAMETER Name
-    The name of the theme to apply
+    The name of a local theme (see Get-PoshifyTheme).
 
 .PARAMETER ThemePath
-    Optional direct path to a theme file
+    Direct path to a theme file. Accepts pipeline input from Get-PoshifyTheme.
+
+.PARAMETER NoApply
+    Only update the selection and profile; leave the prompt of the current session unchanged.
 
 .EXAMPLE
     Set-PoshifyTheme -Name "agnoster"
@@ -238,89 +448,78 @@ function Install-PoshifyTheme {
     Set-PoshifyTheme -ThemePath "C:\path\to\custom.omp.json"
     Sets a custom theme file as the current prompt
 
+.EXAMPLE
+    Get-PoshifyTheme | Get-Random | Set-PoshifyTheme
+    Switches to a random local theme
+
 .OUTPUTS
     None
 #>
 function Set-PoshifyTheme {
-    [CmdletBinding()]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingInvokeExpression', '', Justification = 'oh-my-posh init output is designed to be invoked')]
+    [CmdletBinding(SupportsShouldProcess, DefaultParameterSetName = 'ByName')]
     param(
-        [Parameter(ParameterSetName = "ByName", Position = 0)]
+        [Parameter(Mandatory = $true, ParameterSetName = 'ByName', Position = 0)]
         [string]$Name,
-        
-        [Parameter(ParameterSetName = "ByPath")]
-        [string]$ThemePath
+
+        [Parameter(Mandatory = $true, ParameterSetName = 'ByPath', ValueFromPipelineByPropertyName = $true)]
+        [Alias('Path', 'FullName')]
+        [string]$ThemePath,
+
+        [switch]$NoApply
     )
 
-    try {
-        # Determine theme file path
-        $themeFile = if ($PSCmdlet.ParameterSetName -eq "ByPath") {
-            if (-not (Test-Path $ThemePath)) {
-                Write-Error "Theme file not found: $ThemePath"
+    process {
+        if ($PSCmdlet.ParameterSetName -eq 'ByPath') {
+            $item = Get-Item -LiteralPath $ThemePath -ErrorAction SilentlyContinue
+            if (-not $item -or $item.PSIsContainer) {
+                Write-Error -Message "Theme file not found: $ThemePath" -Category ObjectNotFound -TargetObject $ThemePath
                 return
             }
-            Get-Item $ThemePath
-        } else {
-            # Find theme by name
-            $localThemes = Get-PoshifyTheme -Name $Name
-            if (-not $localThemes) {
-                Write-Error "Theme '$Name' not found locally"
-                Write-Host "Use Find-PoshifyTheme to discover themes and Install-PoshifyTheme to download them" -ForegroundColor Yellow
+            $themeName = Get-PoshifyThemeName $item.Name
+            $themeFile = $item.FullName
+        }
+        else {
+            $theme = Resolve-PoshifySingleTheme -Match (Select-PoshifyThemeMatch -Theme (Get-PoshifyTheme) -Name $Name) -Name $Name `
+                -Location 'locally. Use Find-PoshifyTheme and Install-PoshifyTheme to get it'
+            if (-not $theme) {
                 return
             }
-            $localThemes[0]
+            $themeName = $theme.Name
+            $themeFile = $theme.Path
         }
 
-        # Check if oh-my-posh is installed
-        $ohMyPosh = Get-Command oh-my-posh -ErrorAction SilentlyContinue
+        $ohMyPosh = Get-OhMyPoshCommand
         if (-not $ohMyPosh) {
-            Write-Error "oh-my-posh is not installed or not in PATH"
-            Write-Host "Install oh-my-posh from: https://ohmyposh.dev/docs/installation" -ForegroundColor Yellow
+            Write-Error -Message 'oh-my-posh is not installed or not in PATH. Install it from https://ohmyposh.dev/docs/installation' -Category NotInstalled
             return
         }
 
-        # Backup current profile if it exists
-        $profilePath = $PROFILE.CurrentUserAllHosts
-        if (Test-Path $profilePath) {
-            Write-Host "Backing up current profile..." -ForegroundColor Cyan
-            Copy-Item -Path $profilePath -Destination $script:ProfileBackupPath -Force
+        $profilePath = Get-PoshifyProfilePath
+        if (-not $PSCmdlet.ShouldProcess($profilePath, "Set oh-my-posh theme to '$themeName'")) {
+            return
         }
 
-        # Create or update profile
-        Write-Host "Setting theme to '$($themeFile.BaseName)'..." -ForegroundColor Green
-        
-        $profileContent = @"
-# Poshify Theme - Generated by Poshify Module
-# Theme: $($themeFile.BaseName)
-# Generated on: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+        Write-PoshifyTextFile -Path (Get-PoshifyCurrentThemeFile) -Text $themeFile
 
-oh-my-posh init pwsh --config "$($themeFile.FullName)" | Invoke-Expression
-"@
-
-        # Add to profile
-        if (Test-Path $profilePath) {
-            # Remove existing Poshify entries
-            $existingContent = Get-Content $profilePath -Raw
-            $existingContent = $existingContent -replace '# Poshify Theme - Generated by Poshify Module[\s\S]*?(?=\n#|\noh-my-posh init|\n\$|\nfunction|\nSet-|\nWrite-|\nif|\nImport-Module|\n$)', ''
-            $existingContent = $existingContent.TrimEnd()
-            
-            if ($existingContent) {
-                $profileContent = "$existingContent`n`n$profileContent"
+        $original = if (Test-Path -LiteralPath $profilePath) { Read-PoshifyTextFile -Path $profilePath }
+        $content = Merge-PoshifyProfileBlock -Content $original.Text
+        if ($content -cne $original.Text) {
+            Write-Verbose "Updating Poshify block in $profilePath"
+            if ($original) {
+                Write-PoshifyTextFile -Path $profilePath -Text $content -Encoding $original.Encoding
+            }
+            else {
+                Write-PoshifyTextFile -Path $profilePath -Text $content
             }
         }
 
-        Set-Content -Path $profilePath -Value $profileContent -Force
-        
-        Write-Host "Theme set successfully!" -ForegroundColor Green
-        Write-Host "Theme file: $($themeFile.FullName)" -ForegroundColor Cyan
-        Write-Host "Profile updated: $profilePath" -ForegroundColor Cyan
-        Write-Host "" -ForegroundColor Yellow
-        Write-Host "To apply the theme immediately, restart PowerShell or run:" -ForegroundColor Yellow
-        Write-Host "  oh-my-posh init pwsh --config `"$($themeFile.FullName)`" | Invoke-Expression" -ForegroundColor Cyan
-        
-    }
-    catch {
-        Write-Error "Failed to set theme: $($_.Exception.Message)"
-        Write-Host "Make sure you have write permissions to your PowerShell profile" -ForegroundColor Yellow
+        if (-not $NoApply) {
+            # oh-my-posh's init script installs its prompt globally, so it can run from module scope
+            (& $ohMyPosh init pwsh --config $themeFile) -join [Environment]::NewLine | Invoke-Expression
+        }
+
+        Write-Verbose "Theme set to '$themeName' ($themeFile)"
     }
 }
 
@@ -329,8 +528,9 @@ oh-my-posh init pwsh --config "$($themeFile.FullName)" | Invoke-Expression
     Resets the PowerShell prompt to default
 
 .DESCRIPTION
-    Removes oh-my-posh configuration from the user's PowerShell profile
-and restores the default PowerShell prompt
+    Removes the Poshify block from your PowerShell profile, clears the theme selection, and
+    unloads oh-my-posh from the current session. Any oh-my-posh setup in your profile that
+    Poshify did not create is left untouched and reported as a warning.
 
 .EXAMPLE
     Reset-PoshifyTheme
@@ -340,69 +540,34 @@ and restores the default PowerShell prompt
     None
 #>
 function Reset-PoshifyTheme {
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess)]
     param()
 
-    try {
-        $profilePath = $PROFILE.CurrentUserAllHosts
-        
-        if (-not (Test-Path $profilePath)) {
-            Write-Host "No PowerShell profile found - prompt is already default" -ForegroundColor Yellow
-            return
-        }
-
-        # Read current profile
-        $profileContent = Get-Content $profilePath -Raw
-        
-        # Check if Poshify theme is configured
-        if ($profileContent -notmatch '# Poshify Theme - Generated by Poshify Module') {
-            Write-Host "No Poshify theme configuration found in profile" -ForegroundColor Yellow
-            
-            # Check for any oh-my-posh configuration
-            if ($profileContent -match 'oh-my-posh init') {
-                Write-Warning "Found oh-my-posh configuration in profile, but it's not managed by Poshify"
-                $confirm = Read-Host "Do you want to remove all oh-my-posh configuration? (y/N)"
-                if ($confirm -ne 'y') {
-                    return
-                }
-                
-                # Remove all oh-my-posh lines
-                $profileContent = $profileContent -replace 'oh-my-posh init[\s\S]*?\n', "`n"
-                $profileContent = $profileContent -replace '\n{3,}', "`n`n"
-                $profileContent = $profileContent.Trim()
-                
-                Set-Content -Path $profilePath -Value $profileContent -Force
-                Write-Host "All oh-my-posh configuration removed from profile" -ForegroundColor Green
-            } else {
-                Write-Host "Prompt is already using default PowerShell configuration" -ForegroundColor Green
-            }
-            return
-        }
-
-        # Restore backup if available
-        if (Test-Path $script:ProfileBackupPath) {
-            Write-Host "Restoring profile from backup..." -ForegroundColor Cyan
-            Copy-Item -Path $script:ProfileBackupPath -Destination $profilePath -Force
-            Remove-Item -Path $script:ProfileBackupPath -Force -ErrorAction SilentlyContinue
-            Write-Host "Profile restored from backup" -ForegroundColor Green
-        } else {
-            # Remove Poshify configuration
-            Write-Host "Removing Poshify theme configuration..." -ForegroundColor Cyan
-            $profileContent = $profileContent -replace '# Poshify Theme - Generated by Poshify Module[\s\S]*?(?=\n#|\n\$|\nfunction|\nSet-|\nWrite-|\nif|\nImport-Module|\n$)', ''
-            $profileContent = $profileContent.TrimEnd()
-            
-            Set-Content -Path $profilePath -Value $profileContent -Force
-            Write-Host "Poshify theme configuration removed" -ForegroundColor Green
-        }
-
-        Write-Host "PowerShell prompt reset to default" -ForegroundColor Green
-        Write-Host "Restart PowerShell to see the changes" -ForegroundColor Yellow
-        
+    $profilePath = Get-PoshifyProfilePath
+    if (-not $PSCmdlet.ShouldProcess($profilePath, 'Remove Poshify theme configuration')) {
+        return
     }
-    catch {
-        Write-Error "Failed to reset theme: $($_.Exception.Message)"
-        Write-Host "Make sure you have write permissions to your PowerShell profile" -ForegroundColor Yellow
+
+    if (Test-Path -LiteralPath $profilePath) {
+        $original = Read-PoshifyTextFile -Path $profilePath
+        $content = Merge-PoshifyProfileBlock -Content $original.Text -Remove
+        if ($content -cne $original.Text) {
+            Write-PoshifyTextFile -Path $profilePath -Text $content -Encoding $original.Encoding
+            Write-Verbose "Removed Poshify block from $profilePath"
+        }
+        else {
+            Write-Verbose "No Poshify block found in $profilePath"
+        }
+
+        Select-String -LiteralPath $profilePath -Pattern 'oh-my-posh(\.exe)?[''"]?\s+init' | ForEach-Object {
+            Write-Warning "Your profile still initializes oh-my-posh outside Poshify (line $($_.LineNumber)): $($_.Line.Trim())"
+        }
     }
+
+    Remove-Item -LiteralPath (Get-PoshifyCurrentThemeFile) -Force -ErrorAction SilentlyContinue
+
+    # Unloading oh-my-posh's module restores the prompt it replaced
+    Get-Module -Name oh-my-posh-core | Remove-Module -Force
 }
 
 # Create CLI-friendly aliases for common operations
@@ -417,85 +582,101 @@ function Poshify {
     <#
     .SYNOPSIS
         Main Poshify CLI utility command
-    
+
     .DESCRIPTION
         Provides a command-line interface for managing oh-my-posh themes
-        
+
     .EXAMPLE
         Poshify theme install agnoster
         Downloads and installs the agnoster theme
-        
+
     .EXAMPLE
         Poshify theme list
         Lists all available local themes
-        
+
     .EXAMPLE
         Poshify theme find
         Finds available themes online
-        
+
     .EXAMPLE
         Poshify theme set agnoster
         Sets the agnoster theme as current
-        
+
     .EXAMPLE
         Poshify theme reset
         Resets theme to default PowerShell prompt
     #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '', Justification = 'Interactive CLI front-end')]
     [CmdletBinding()]
     param(
         [Parameter(Position = 0, Mandatory = $true)]
         [ValidateSet('theme')]
         [string]$Command,
-        
+
         [Parameter(Position = 1, Mandatory = $true)]
         [ValidateSet('list', 'find', 'install', 'set', 'reset')]
         [string]$Action,
-        
+
         [Parameter(Position = 2)]
         [string]$ThemeName
     )
 
+    if ($Action -in 'install', 'set' -and -not $ThemeName) {
+        Write-Error "Theme name is required for $Action action"
+        Write-Host "Usage: Poshify theme $Action <theme-name>" -ForegroundColor Yellow
+        return
+    }
+
     switch ($Action) {
         'list' {
-            Get-PoshifyTheme
+            $themes = Get-PoshifyTheme
+            if (-not $themes) {
+                Write-Host 'No local themes found. Use "Poshify theme find" and "Poshify theme install <name>" to get some.' -ForegroundColor Yellow
+            }
+            $themes
         }
         'find' {
-            if ($ThemeName) {
-                Find-PoshifyTheme -Name $ThemeName
-            } else {
-                Find-PoshifyTheme
-            }
+            Find-PoshifyTheme -Name $ThemeName
         }
         'install' {
-            if (-not $ThemeName) {
-                Write-Error "Theme name is required for install action"
-                Write-Host "Usage: Poshify theme install <theme-name>" -ForegroundColor Yellow
-                return
+            $theme = Install-PoshifyTheme -Name $ThemeName
+            if ($theme) {
+                Write-Host "Theme '$($theme.Name)' is ready. Apply it with: Poshify theme set $($theme.Name)" -ForegroundColor Green
             }
-            Install-PoshifyTheme -Name $ThemeName
         }
         'set' {
-            if (-not $ThemeName) {
-                Write-Error "Theme name is required for set action"
-                Write-Host "Usage: Poshify theme set <theme-name>" -ForegroundColor Yellow
-                return
+            Set-PoshifyTheme -Name $ThemeName -ErrorVariable setError
+            if (-not $setError) {
+                Write-Host "Theme set to '$ThemeName'." -ForegroundColor Green
             }
-            Set-PoshifyTheme -Name $ThemeName
         }
         'reset' {
             Reset-PoshifyTheme
-        }
-        default {
-            Write-Error "Unknown action: $Action"
-            Write-Host "Available actions: list, find, install, set, reset" -ForegroundColor Yellow
+            Write-Host 'Poshify theme removed. Open a new session if your prompt has not changed.' -ForegroundColor Green
         }
     }
 }
 
+# Tab completion for local theme names
+$localThemeCompleter = {
+    param($commandName, $parameterName, $wordToComplete, $commandAst, $fakeBoundParameters)
+
+    # Install and find work with online themes; don't suggest local names there
+    if ($commandName -eq 'Poshify' -and $fakeBoundParameters['Action'] -ne 'set') {
+        return
+    }
+
+    Get-PoshifyTheme | Where-Object { $_.Name -like "$wordToComplete*" } | ForEach-Object {
+        [System.Management.Automation.CompletionResult]::new($_.Name, $_.Name, 'ParameterValue', $_.Path)
+    }
+}
+Register-ArgumentCompleter -CommandName 'Get-PoshifyTheme', 'Set-PoshifyTheme' -ParameterName 'Name' -ScriptBlock $localThemeCompleter
+Register-ArgumentCompleter -CommandName 'Poshify' -ParameterName 'ThemeName' -ScriptBlock $localThemeCompleter
+
 # Export module functions and aliases
 Export-ModuleMember -Function @(
     'Get-PoshifyTheme',
-    'Find-PoshifyTheme', 
+    'Find-PoshifyTheme',
     'Install-PoshifyTheme',
     'Set-PoshifyTheme',
     'Reset-PoshifyTheme',
