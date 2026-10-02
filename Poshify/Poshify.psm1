@@ -18,6 +18,11 @@ $script:ThemeFilePattern = '\.omp\.(json|ya?ml|toml)$'
 $script:ProfileBlockStart = '# >>> poshify >>>'
 $script:ProfileBlockEnd = '# <<< poshify <<<'
 $script:CacheMaxAge = [TimeSpan]::FromMinutes(60)
+$script:DefaultTheme = 'jandedobbeleer'
+$script:SetupThemeChoices = 'jandedobbeleer', 'atomic', 'paradox', 'powerlevel10k_rainbow', 'catppuccin_mocha', 'tokyonight_storm', 'night-owl', 'pure'
+$script:NerdFontName = 'Meslo'
+$script:NerdFontFamily = 'MesloLGM Nerd Font'
+$script:OhMyPoshInstallUrl = 'https://ohmyposh.dev/docs/installation'
 
 # Show a compact table by default; the remaining properties are still on the objects
 Update-TypeData -TypeName 'Poshify.Theme' -DefaultDisplayPropertySet 'Name', 'Source', 'Current', 'Favorite' -Force
@@ -25,8 +30,70 @@ Update-TypeData -TypeName 'Poshify.OnlineTheme' -DefaultDisplayPropertySet 'Name
 
 #region Private helpers
 
-function Get-PoshifyProfilePath {
-    $PROFILE.CurrentUserAllHosts
+function Test-PoshifyWindows {
+    $PSVersionTable.PSEdition -eq 'Desktop' -or $IsWindows
+}
+
+function Get-PoshifyEditionName {
+    param([string]$Edition)
+    if ($Edition -eq 'Desktop') { 'Windows PowerShell' } else { 'PowerShell 7' }
+}
+
+# Profiles Poshify manages: the running edition's, plus on Windows the other edition's, so the
+# theme shows up in both Windows PowerShell and PowerShell 7
+function Get-PoshifyProfileTarget {
+    [PSCustomObject]@{ Edition = $PSVersionTable.PSEdition; Path = $PROFILE.CurrentUserAllHosts; IsCurrent = $true }
+
+    if (-not (Test-PoshifyWindows)) {
+        return
+    }
+    $documents = [Environment]::GetFolderPath('MyDocuments')
+    if ($PSVersionTable.PSEdition -eq 'Core') {
+        [PSCustomObject]@{ Edition = 'Desktop'; Path = (Join-Path $documents 'WindowsPowerShell\profile.ps1'); IsCurrent = $false }
+    }
+    elseif (Get-Command -Name pwsh -CommandType Application -ErrorAction SilentlyContinue) {
+        [PSCustomObject]@{ Edition = 'Core'; Path = (Join-Path $documents 'PowerShell\profile.ps1'); IsCurrent = $false }
+    }
+}
+
+# Execution policy a new terminal of the given edition will run with
+function Get-PoshifyExecutionPolicy {
+    param([string]$Edition)
+
+    if (-not (Test-PoshifyWindows)) {
+        return 'Unrestricted'
+    }
+
+    $exe = if ($Edition -eq $PSVersionTable.PSEdition) { (Get-Process -Id $PID).Path }
+    elseif ($Edition -eq 'Desktop') { 'powershell.exe' }
+    else { 'pwsh.exe' }
+
+    # A process-scoped policy (e.g. -ExecutionPolicy Bypass) is inherited through this variable;
+    # hide it so the child reports what a fresh terminal gets
+    $inherited = $env:PSExecutionPolicyPreference
+    $env:PSExecutionPolicyPreference = $null
+    try {
+        $policy = & $exe -NoLogo -NoProfile -NonInteractive -Command 'Get-ExecutionPolicy' 2>$null | Select-Object -First 1
+        if ($policy) { "$policy".Trim() } else { 'Unknown' }
+    }
+    catch {
+        'Unknown'
+    }
+    finally {
+        $env:PSExecutionPolicyPreference = $inherited
+    }
+}
+
+function Test-PoshifyPolicyBlocksProfile {
+    param([string]$Policy)
+    $Policy -in 'Restricted', 'AllSigned', 'Undefined'
+}
+
+function Get-PoshifyPolicyAdvice {
+    param([string]$Edition, [string]$Policy)
+    $name = Get-PoshifyEditionName $Edition
+    "$name can't run your profile because its execution policy is $Policy, so the theme won't load there. " +
+    "To allow local scripts, run this in ${name}: Set-ExecutionPolicy -Scope CurrentUser RemoteSigned"
 }
 
 function Get-OhMyPoshCommand {
@@ -145,11 +212,14 @@ function Resolve-PoshifySingleTheme {
     Write-Error -Message "Theme name '$Name' is ambiguous $Location. Matches: $names" -Category InvalidArgument -TargetObject $Name
 }
 
-# Resolves -Name or -ThemePath to an object with Name and Path, writing an error if that fails
+# Resolves -Name or -ThemePath to an object with Name and Path, writing an error if that fails.
+# With -IncludeOnline, a name with no local match that exactly matches an online theme returns
+# that Poshify.OnlineTheme (which has no Path) so the caller can download it.
 function Resolve-PoshifyThemeFile {
     param(
         [string]$Name,
-        [string]$ThemePath
+        [string]$ThemePath,
+        [switch]$IncludeOnline
     )
 
     if ($ThemePath) {
@@ -161,8 +231,18 @@ function Resolve-PoshifyThemeFile {
         return [PSCustomObject]@{ Name = Get-PoshifyThemeName $item.Name; Path = $item.FullName }
     }
 
-    Resolve-PoshifySingleTheme -Match (Select-PoshifyThemeMatch -Theme (Get-PoshifyTheme) -Name $Name) -Name $Name `
-        -Location 'locally. Use Find-PoshifyTheme and Install-PoshifyTheme to get it'
+    $local = @(Select-PoshifyThemeMatch -Theme (Get-PoshifyTheme) -Name $Name)
+    if ($local.Count -eq 0 -and $IncludeOnline) {
+        $online = @(Get-PoshifyOnlineThemeList) | Where-Object { $_.Name -eq $Name } | Select-Object -First 1
+        if ($online) {
+            return $online
+        }
+    }
+
+    $location = if ($local.Count -gt 1) { 'locally' }
+    elseif ($IncludeOnline) { 'locally or online. Use Find-PoshifyTheme to search' }
+    else { 'locally. Use Find-PoshifyTheme and Install-PoshifyTheme to get it' }
+    Resolve-PoshifySingleTheme -Match $local -Name $Name -Location $location
 }
 
 # Online theme list, cached for an hour. A stale cache is used when GitHub can't be reached.
@@ -323,18 +403,250 @@ function Write-PoshifyTextFile {
     [System.IO.File]::WriteAllText($Path, $Text, $Encoding)
 }
 
+#region Theme resolution
+# These two functions are also copied into the generated init.ps1, which runs at shell startup
+# without loading the module, so they must not call anything else in this module.
+
+# Theme set by the nearest .poshify (or .ompconfig) file at or above a folder. Returns nothing when
+# no folder file applies; otherwise Marker and Value, plus Path when the theme can be used or
+# Message explaining why not.
+function Resolve-PoshifyLocationTheme {
+    param(
+        [string]$Path,
+        [string]$PoshifyHome
+    )
+
+    $themeDirs = @($PoshifyHome, $env:POSH_THEMES_PATH) | Where-Object { $_ }
+    $directory = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    while ($directory) {
+        foreach ($markerName in '.poshify', '.ompconfig') {
+            $marker = Join-Path $directory.FullName $markerName
+            if (-not (Test-Path -LiteralPath $marker -PathType Leaf)) {
+                continue
+            }
+
+            $value = Get-Content -LiteralPath $marker -ErrorAction SilentlyContinue |
+                ForEach-Object { $_.Trim() } |
+                Where-Object { $_ -and -not $_.StartsWith('#') } |
+                Select-Object -First 1
+            $result = [PSCustomObject]@{ Marker = $marker; Value = $value; Status = $null; Path = $null; File = $null; Message = $null }
+            if (-not $value) {
+                $result.Status = 'Empty'
+                $result.Message = "$marker is empty."
+                return $result
+            }
+
+            # A theme name, looked up in the theme folders
+            if ($value -notmatch '[\\/]') {
+                $fileNames = if ($value -match '\.omp\.(json|ya?ml|toml)$') { , $value } else { 'json', 'yaml', 'yml', 'toml' | ForEach-Object { "$value.omp.$_" } }
+                foreach ($themeDir in $themeDirs) {
+                    foreach ($fileName in $fileNames) {
+                        $candidate = Join-Path $themeDir $fileName
+                        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+                            $result.Status = 'Active'
+                            $result.Path = $candidate
+                            $result.File = $candidate
+                            return $result
+                        }
+                    }
+                }
+            }
+
+            # A path to a theme file, relative to the folder file
+            $file = if ([IO.Path]::IsPathRooted($value)) { $value } else { Join-Path $directory.FullName $value }
+            if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
+                $result.Status = 'NotFound'
+                $result.Message = "theme '$value' from $marker was not found. Install it with: Poshify theme install $value"
+                return $result
+            }
+            $file = (Resolve-Path -LiteralPath $file).ProviderPath
+            $result.File = $file
+
+            # Theme files can run commands, so files outside the theme folders must be trusted first
+            $inThemeDir = $themeDirs | Where-Object { $file.StartsWith((Join-Path $_ ''), [StringComparison]::OrdinalIgnoreCase) }
+            $trustFile = Join-Path $PoshifyHome 'trusted'
+            $trusted = $inThemeDir -or ((Test-Path -LiteralPath $trustFile) -and
+                (Get-Content -LiteralPath $trustFile) -contains "$((Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash) $file")
+            if ($trusted) {
+                $result.Status = 'Active'
+                $result.Path = $file
+            }
+            else {
+                $result.Status = 'Untrusted'
+                $result.Message = "$marker uses a theme file that isn't trusted yet ($file). Theme files can run commands; if you trust it, run 'Poshify folder trust' in $($directory.FullName)."
+            }
+            return $result
+        }
+        $directory = $directory.Parent
+    }
+}
+
+# Theme file to use where no folder file applies: the selected theme, or a random one when the
+# selection is 'random' or 'random:favorites'
+function Select-PoshifyDefaultThemeFile {
+    param([string]$PoshifyHome)
+
+    $selection = Get-Content -LiteralPath (Join-Path $PoshifyHome 'current') -TotalCount 1 -ErrorAction SilentlyContinue
+    if (-not $selection) {
+        return
+    }
+    if ($selection -notlike 'random*') {
+        if (Test-Path -LiteralPath $selection -PathType Leaf) { $selection }
+        return
+    }
+
+    $themes = foreach ($themeDir in @($PoshifyHome, $env:POSH_THEMES_PATH)) {
+        if ($themeDir) {
+            Get-ChildItem -LiteralPath $themeDir -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '\.omp\.(json|ya?ml|toml)$' }
+        }
+    }
+    if ($selection -eq 'random:favorites') {
+        $favorites = $null
+        try {
+            $favorites = Get-Content -LiteralPath (Join-Path $PoshifyHome '.favorites.json') -Raw -ErrorAction Stop | ConvertFrom-Json
+        }
+        catch {
+            $favorites = $null
+        }
+        $favorites = @($favorites | ForEach-Object { $_ })
+        $themes = $themes | Where-Object { ($_.Name -replace '\.omp\.(json|ya?ml|toml)$', '') -in $favorites }
+    }
+    $themes | Get-Random | ForEach-Object { $_.FullName }
+}
+
+#endregion
+
+function Get-PoshifyInitScriptPath {
+    Join-Path $script:PoshifyHome 'init.ps1'
+}
+
+# Script loaded by the profile block at startup. It picks the theme for the current folder and
+# re-initializes oh-my-posh whenever a prompt is drawn in a folder that needs a different theme.
+function Get-PoshifyInitScript {
+    $template = @'
+# Generated by Poshify. Don't edit this file: Poshify rewrites it.
+# It is loaded by the Poshify block in your PowerShell profile.
+if (-not (Get-Command -Name oh-my-posh -CommandType Application -ErrorAction SilentlyContinue)) {
+    return
+}
+
+function global:Resolve-PoshifyLocationTheme {
+__RESOLVE__
+}
+
+function global:Select-PoshifyDefaultThemeFile {
+__DEFAULT__
+}
+
+$global:_poshifyHome = '__HOME__'
+$global:_poshifyActiveConfig = $null
+$global:_poshifyLastLocation = $null
+$global:_poshifyWarned = @{}
+$global:_poshifyDefaultConfig = Select-PoshifyDefaultThemeFile -PoshifyHome $global:_poshifyHome
+
+$global:_poshifyUpdate = {
+    $location = $ExecutionContext.SessionState.Path.CurrentFileSystemLocation.ProviderPath
+    if ($location -eq $global:_poshifyLastLocation) {
+        return
+    }
+    $global:_poshifyLastLocation = $location
+
+    $config = $global:_poshifyDefaultConfig
+    $folder = Resolve-PoshifyLocationTheme -Path $location -PoshifyHome $global:_poshifyHome
+    if ($folder.Path) {
+        $config = $folder.Path
+    }
+    elseif ($folder.Message -and -not $global:_poshifyWarned.ContainsKey($folder.Marker)) {
+        $global:_poshifyWarned[$folder.Marker] = $true
+        Write-Warning "Poshify: $($folder.Message)"
+    }
+
+    if (-not $config -or $config -eq $global:_poshifyActiveConfig) {
+        return
+    }
+    $global:_poshifyActiveConfig = $config
+
+    $init = (oh-my-posh init pwsh --config $config) -join [Environment]::NewLine
+    if (-not $init.Trim()) {
+        return
+    }
+    Invoke-Expression $init
+
+    # oh-my-posh installs its own prompt; keep it as the base and wrap it again
+    $prompt = (Get-Item -Path Function:\prompt).ScriptBlock
+    if ($prompt.ToString() -ne $global:_poshifyPrompt.ToString()) {
+        $global:_poshifyBasePrompt = $prompt
+    }
+    Set-Item -Path Function:global:prompt -Value $global:_poshifyPrompt
+}
+
+$global:_poshifyPrompt = {
+    # Pass the last command's status through to oh-my-posh, which reads this variable when set
+    $global:NVS_ORIGINAL_LASTEXECUTIONSTATUS = $?
+    $exitCode = $global:LASTEXITCODE
+    & $global:_poshifyUpdate
+    $global:LASTEXITCODE = $exitCode
+    if ($global:_poshifyBasePrompt) {
+        & $global:_poshifyBasePrompt
+    }
+    else {
+        "PS $($ExecutionContext.SessionState.Path.CurrentLocation)$('>' * ($NestedPromptLevel + 1)) "
+    }
+}
+
+& $global:_poshifyUpdate
+'@
+
+    $template.Replace('__HOME__', ($script:PoshifyHome -replace "'", "''")).
+        Replace('__RESOLVE__', ${function:Resolve-PoshifyLocationTheme}.ToString().Trim()).
+        Replace('__DEFAULT__', ${function:Select-PoshifyDefaultThemeFile}.ToString().Trim()).
+        Replace("`r`n", "`n")
+}
+
+function Write-PoshifyInitScript {
+    $path = Get-PoshifyInitScriptPath
+    $content = Get-PoshifyInitScript
+    if ((Test-Path -LiteralPath $path) -and ((Read-PoshifyTextFile -Path $path).Text -ceq $content)) {
+        return
+    }
+    Write-PoshifyTextFile -Path $path -Text $content
+}
+
+# Loads (or reloads) the init script into this session, applying the theme for the current folder
+function Invoke-PoshifyInitScript {
+    $path = Get-PoshifyInitScriptPath
+    if (Test-Path -LiteralPath $path) {
+        . $path
+    }
+}
+
+# Undoes the init script in this session and restores PowerShell's default prompt
+function Clear-PoshifySessionPrompt {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidGlobalVars', '', Justification = 'Session state shared with the generated init script')]
+    param()
+
+    Get-Module -Name oh-my-posh-core | Remove-Module -Force
+
+    if ($global:_poshifyPrompt) {
+        Set-Item -Path Function:global:prompt -Value { "PS $($ExecutionContext.SessionState.Path.CurrentLocation)$('>' * ($NestedPromptLevel + 1)) " }
+    }
+    Remove-Variable -Scope Global -ErrorAction SilentlyContinue -Name @(
+        '_poshifyPrompt', '_poshifyUpdate', '_poshifyBasePrompt', '_poshifyHome', '_poshifyActiveConfig',
+        '_poshifyLastLocation', '_poshifyWarned', '_poshifyDefaultConfig', 'NVS_ORIGINAL_LASTEXECUTIONSTATUS'
+    )
+    Remove-Item -Path Function:global:Resolve-PoshifyLocationTheme, Function:global:Select-PoshifyDefaultThemeFile -ErrorAction SilentlyContinue
+}
+
 function Get-PoshifyProfileBlock {
     param([string]$NewLine)
 
-    $pointer = (Get-PoshifyCurrentThemeFile) -replace "'", "''"
+    $initScript = (Get-PoshifyInitScriptPath) -replace "'", "''"
     @(
         $script:ProfileBlockStart
         '# Managed by Poshify - use Set-PoshifyTheme / Reset-PoshifyTheme instead of editing this block.'
-        "`$poshifyTheme = Get-Content -LiteralPath '$pointer' -TotalCount 1 -ErrorAction SilentlyContinue"
-        'if ($poshifyTheme -and (Test-Path -LiteralPath $poshifyTheme) -and (Get-Command oh-my-posh -ErrorAction SilentlyContinue)) {'
-        '    oh-my-posh init pwsh --config $poshifyTheme | Invoke-Expression'
-        '}'
-        'Remove-Variable -Name poshifyTheme -ErrorAction SilentlyContinue'
+        "`$poshifyInit = '$initScript'"
+        'if (Test-Path -LiteralPath $poshifyInit) { . $poshifyInit }'
+        'Remove-Variable -Name poshifyInit -ErrorAction SilentlyContinue'
         $script:ProfileBlockEnd
     ) -join $NewLine
 }
@@ -378,6 +690,207 @@ function Merge-PoshifyProfileBlock {
         if ($result) { $result += $newLine }
     }
     $result
+}
+
+# Adds, refreshes or removes the Poshify block in every managed profile
+function Write-PoshifyProfileBlock {
+    param([switch]$Remove)
+
+    if (-not $Remove) {
+        Write-PoshifyInitScript
+    }
+
+    foreach ($target in Get-PoshifyProfileTarget) {
+        $exists = Test-Path -LiteralPath $target.Path
+        if ($Remove -and -not $exists) {
+            continue
+        }
+
+        $original = if ($exists) { Read-PoshifyTextFile -Path $target.Path }
+        $content = Merge-PoshifyProfileBlock -Content $original.Text -Remove:$Remove
+        if ($content -ceq $original.Text) {
+            continue
+        }
+
+        if ($Remove) {
+            Write-PoshifyTextFile -Path $target.Path -Text $content -Encoding $original.Encoding
+            Write-Verbose "Removed Poshify block from $($target.Path)"
+            continue
+        }
+
+        $policy = Get-PoshifyExecutionPolicy -Edition $target.Edition
+        $blocked = Test-PoshifyPolicyBlocksProfile $policy
+        if ($blocked -and -not $exists -and -not $target.IsCurrent) {
+            # Creating a profile that can't run would only add an error to every new session
+            Write-Verbose "Skipping the $(Get-PoshifyEditionName $target.Edition) profile: its execution policy is $policy"
+            continue
+        }
+
+        if ($original) {
+            Write-PoshifyTextFile -Path $target.Path -Text $content -Encoding $original.Encoding
+        }
+        else {
+            Write-PoshifyTextFile -Path $target.Path -Text $content
+        }
+        Write-Verbose "Updated Poshify block in $($target.Path)"
+
+        if ($blocked) {
+            Write-Warning (Get-PoshifyPolicyAdvice -Edition $target.Edition -Policy $policy)
+        }
+    }
+}
+
+# How to install oh-my-posh on this platform, or nothing if no supported installer is available
+function Get-PoshifyOhMyPoshInstaller {
+    if (Test-PoshifyWindows) {
+        if (Get-Command -Name winget -ErrorAction SilentlyContinue) {
+            [PSCustomObject]@{ Description = 'winget'; FilePath = 'winget'; ArgumentList = @('install', 'JanDeDobbeleer.OhMyPosh', '--source', 'winget', '--scope', 'user') }
+        }
+    }
+    elseif ($IsMacOS -and (Get-Command -Name brew -ErrorAction SilentlyContinue)) {
+        [PSCustomObject]@{ Description = 'Homebrew'; FilePath = 'brew'; ArgumentList = @('install', 'jandedobbeleer/oh-my-posh/oh-my-posh') }
+    }
+    elseif ((Get-Command -Name curl -ErrorAction SilentlyContinue) -and (Get-Command -Name bash -ErrorAction SilentlyContinue)) {
+        [PSCustomObject]@{ Description = 'the official install script'; FilePath = 'bash'; ArgumentList = @('-c', 'curl -s https://ohmyposh.dev/install.sh | bash -s -- -d ~/.local/bin') }
+    }
+}
+
+function Invoke-PoshifyInstaller {
+    param($Installer)
+    & $Installer.FilePath @($Installer.ArgumentList)
+}
+
+# Picks up PATH entries added by an installer without discarding this session's own entries
+function Sync-PoshifySessionPath {
+    $separator = [IO.Path]::PathSeparator
+    $entries = if (Test-PoshifyWindows) {
+        foreach ($scope in 'Machine', 'User') {
+            [Environment]::GetEnvironmentVariable('Path', $scope) -split $separator
+        }
+    }
+    else {
+        Join-Path $HOME '.local/bin'
+        '/opt/homebrew/bin'
+        '/usr/local/bin'
+    }
+
+    $current = $env:PATH -split $separator
+    $missing = $entries | Where-Object { $_ -and $_ -notin $current -and (Test-Path -LiteralPath $_) }
+    if ($missing) {
+        $env:PATH = (@($current) + @($missing)) -join $separator
+    }
+}
+
+# Families of installed Nerd Fonts, e.g. 'MesloLGM Nerd Font'
+function Get-PoshifyNerdFont {
+    $names = if (Test-PoshifyWindows) {
+        foreach ($key in 'HKCU:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts', 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts') {
+            $fonts = Get-ItemProperty -Path $key -ErrorAction SilentlyContinue
+            if ($fonts) { $fonts.PSObject.Properties.Name }
+        }
+    }
+    elseif ($IsMacOS) {
+        Get-ChildItem -Path (Join-Path $HOME 'Library/Fonts'), '/Library/Fonts' -File -ErrorAction SilentlyContinue | ForEach-Object { $_.BaseName }
+    }
+    elseif (Get-Command -Name fc-list -ErrorAction SilentlyContinue) {
+        fc-list : family
+    }
+
+    $names | ForEach-Object { if ($_ -match '^(.*?Nerd ?Font)') { $Matches[1] } } | Sort-Object -Unique
+}
+
+function Test-PoshifyNerdFontFace {
+    param([string]$Face)
+    $Face -match 'Nerd ?Font|\bNF[MP]?\b'
+}
+
+function Get-PoshifyTerminalSettingsPath {
+    if (-not (Test-PoshifyWindows)) {
+        return
+    }
+    @(
+        Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState\settings.json'
+        Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.WindowsTerminalPreview_8wekyb3d8bbwe\LocalState\settings.json'
+        Join-Path $env:LOCALAPPDATA 'Microsoft\Windows Terminal\settings.json'
+    ) | Where-Object { Test-Path -LiteralPath $_ }
+}
+
+function Read-PoshifyTerminalConfig {
+    param([string]$Path)
+
+    $text = [IO.File]::ReadAllText($Path)
+    $parameters = @{}
+    if ((Get-Command ConvertFrom-Json).Parameters.ContainsKey('DateKind')) {
+        $parameters.DateKind = 'String'
+    }
+    [PSCustomObject]@{
+        Text     = $text
+        Settings = $text | ConvertFrom-Json @parameters
+    }
+}
+
+# Default font face of a Windows Terminal settings file
+function Get-PoshifyTerminalFont {
+    param([string]$Path)
+
+    $defaults = (Read-PoshifyTerminalConfig -Path $Path).Settings.profiles.defaults
+    if ($defaults.font.face) { $defaults.font.face }
+    elseif ($defaults.fontFace) { $defaults.fontFace }
+    else { 'Cascadia Mono' }
+}
+
+# Sets the default font of a Windows Terminal settings file, keeping a backup next to it.
+# Returns $false (with a warning) when the file can't be rewritten safely.
+function Write-PoshifyTerminalFont {
+    [CmdletBinding()]
+    param(
+        [string]$Path,
+        [string]$Face
+    )
+
+    $manual = "Set the font manually in Windows Terminal: Settings > Defaults > Appearance > Font face > '$Face'."
+    if ($PSVersionTable.PSEdition -ne 'Core') {
+        Write-Warning "Changing Windows Terminal settings needs PowerShell 7. $manual"
+        return $false
+    }
+
+    $file = Read-PoshifyTerminalConfig -Path $Path
+    if ($file.Text -match '(?m)^\s*//|/\*') {
+        Write-Warning "Windows Terminal's settings contain comments that would be lost. $manual"
+        return $false
+    }
+
+    $profiles = $file.Settings.profiles
+    if ($null -eq $profiles -or $profiles -is [array]) {
+        Write-Warning "Windows Terminal's settings use an unsupported layout. $manual"
+        return $false
+    }
+    if ($null -eq $profiles.defaults) {
+        $profiles | Add-Member -NotePropertyName defaults -NotePropertyValue ([PSCustomObject]@{})
+    }
+    $defaults = $profiles.defaults
+    if ($null -eq $defaults.font) {
+        $defaults | Add-Member -NotePropertyName font -NotePropertyValue ([PSCustomObject]@{})
+    }
+    if ($defaults.font.PSObject.Properties['face']) {
+        $defaults.font.face = $Face
+    }
+    else {
+        $defaults.font | Add-Member -NotePropertyName face -NotePropertyValue $Face
+    }
+    if ($defaults.PSObject.Properties['fontFace']) {
+        $defaults.PSObject.Properties.Remove('fontFace')
+    }
+
+    Copy-Item -LiteralPath $Path -Destination "$Path.poshify-backup" -Force
+    $json = $file.Settings | ConvertTo-Json -Depth 64
+    [IO.File]::WriteAllText($Path, $json, (New-Object System.Text.UTF8Encoding($false)))
+
+    $overrides = @($profiles.list | Where-Object { $_.font.face -and -not (Test-PoshifyNerdFontFace $_.font.face) } | ForEach-Object { $_.name })
+    if ($overrides) {
+        Write-Warning "These Windows Terminal profiles set their own font and won't use '$Face': $($overrides -join ', ')"
+    }
+    $true
 }
 
 #endregion
@@ -455,42 +968,80 @@ function Get-PoshifyTheme {
 
 <#
 .SYNOPSIS
-    Gets the currently selected oh-my-posh theme
+    Gets the oh-my-posh theme in use for a folder
 
 .DESCRIPTION
-    Returns the theme selected with Set-PoshifyTheme, or nothing if no theme is selected.
-    A theme file set by path that is outside the Poshify and oh-my-posh theme folders is
-    reported with Source 'Custom'.
+    Returns the theme Poshify uses in the current folder (or -Path): the theme from the nearest
+    .poshify file, otherwise your default theme from Set-PoshifyTheme. The SelectedBy property
+    says which. Returns nothing if no theme applies.
+
+    A theme file outside the Poshify and oh-my-posh theme folders is reported with Source 'Custom'.
+
+.PARAMETER Path
+    Folder to check instead of the current one.
 
 .EXAMPLE
     Get-PoshifyCurrentTheme
-    Shows the current theme
+    Shows the theme for the current folder
+
+.EXAMPLE
+    Get-PoshifyCurrentTheme | Select-Object Name, SelectedBy
+    Shows the theme and why it applies
 
 .OUTPUTS
     Poshify.Theme
 #>
 function Get-PoshifyCurrentTheme {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidGlobalVars', '', Justification = 'Session state shared with the generated init script')]
     [CmdletBinding()]
     [OutputType('Poshify.Theme')]
-    param()
+    param(
+        [string]$Path
+    )
 
-    $currentPath = Get-PoshifyCurrentThemePath
-    if (-not $currentPath) {
-        Write-Verbose 'No theme is selected. Use Set-PoshifyTheme to select one.'
-        return
+    $location = if ($Path) { (Resolve-Path -LiteralPath $Path -ErrorAction Stop).ProviderPath }
+    else { $ExecutionContext.SessionState.Path.CurrentFileSystemLocation.ProviderPath }
+
+    $folder = Resolve-PoshifyLocationTheme -Path $location -PoshifyHome $script:PoshifyHome
+    if ($folder.Path) {
+        $themePath = $folder.Path
+        $selectedBy = "Folder ($($folder.Marker))"
+    }
+    else {
+        if ($folder.Message) {
+            Write-Warning $folder.Message
+        }
+
+        $selection = Get-PoshifyCurrentThemePath
+        if (-not $selection) {
+            Write-Verbose 'No theme is selected. Use Set-PoshifyTheme to select one.'
+            return
+        }
+        if ($selection -like 'random*') {
+            # The init script picks the random theme when a session starts
+            $themePath = $global:_poshifyDefaultConfig
+            if (-not $themePath) {
+                Write-Verbose 'A random theme is picked when each session starts.'
+                return
+            }
+            $selectedBy = if ($selection -eq 'random:favorites') { 'Random favorite (this session)' } else { 'Random (this session)' }
+        }
+        else {
+            $themePath = $selection
+            $selectedBy = 'Default'
+        }
     }
 
-    $theme = Get-PoshifyTheme | Where-Object { $_.Path -eq $currentPath }
-    if ($theme) {
-        return $theme
+    $theme = Get-PoshifyTheme | Where-Object { $_.Path -eq $themePath }
+    if (-not $theme) {
+        $file = Get-Item -LiteralPath $themePath -ErrorAction SilentlyContinue
+        if (-not $file) {
+            Write-Warning "The selected theme file no longer exists: $themePath"
+            return
+        }
+        $theme = ConvertTo-PoshifyThemeObject -File $file -Source 'Custom' -CurrentPath (Get-PoshifyCurrentThemePath) -Favorites @(Get-PoshifyFavoriteList)
     }
-
-    $file = Get-Item -LiteralPath $currentPath -ErrorAction SilentlyContinue
-    if (-not $file) {
-        Write-Warning "The selected theme file no longer exists: $currentPath"
-        return
-    }
-    ConvertTo-PoshifyThemeObject -File $file -Source 'Custom' -CurrentPath $currentPath -Favorites @(Get-PoshifyFavoriteList)
+    $theme | Add-Member -NotePropertyName SelectedBy -NotePropertyValue $selectedBy -PassThru
 }
 
 <#
@@ -773,17 +1324,31 @@ function Remove-PoshifyTheme {
     Sets the current oh-my-posh theme
 
 .DESCRIPTION
-    Selects a theme, makes sure your PowerShell profile contains the Poshify block that loads the
+    Selects a theme, makes sure your PowerShell profiles contain the Poshify block that loads the
     selected theme at startup, and applies the theme to the current session.
+
+    On Windows, both the PowerShell 7 and Windows PowerShell profiles are set up, so the theme
+    appears in both. A profile that doesn't exist yet is only created for the other edition when
+    its execution policy allows it to run; otherwise you get a warning explaining how to allow it.
 
     The profile block is written once and kept where it is; switching themes afterwards only
     changes the selection stored in ~/.poshthemes/current.
 
+    This is your default theme. Folders with a .poshify file (see Set-PoshifyFolderTheme) use
+    their own theme instead.
+
 .PARAMETER Name
-    The name of a local theme (see Get-PoshifyTheme).
+    The name of a local theme (see Get-PoshifyTheme). If no local theme matches, a theme with
+    exactly this name in the oh-my-posh repository is downloaded first.
 
 .PARAMETER ThemePath
     Direct path to a theme file. Accepts pipeline input from Get-PoshifyTheme.
+
+.PARAMETER Random
+    Use a different random local theme in every new session.
+
+.PARAMETER FromFavorites
+    With -Random, only pick from favorite themes.
 
 .PARAMETER NoApply
     Only update the selection and profile; leave the prompt of the current session unchanged.
@@ -797,14 +1362,17 @@ function Remove-PoshifyTheme {
     Sets a custom theme file as the current prompt
 
 .EXAMPLE
-    Get-PoshifyRandomTheme -FromFavorites | Set-PoshifyTheme
-    Switches to a random favorite theme
+    Set-PoshifyTheme -Random -FromFavorites
+    Uses a random favorite theme in every new session
+
+.EXAMPLE
+    Get-PoshifyRandomTheme | Set-PoshifyTheme
+    Switches to a random theme once and keeps it
 
 .OUTPUTS
     None
 #>
 function Set-PoshifyTheme {
-    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingInvokeExpression', '', Justification = 'oh-my-posh init output is designed to be invoked')]
     [CmdletBinding(SupportsShouldProcess, DefaultParameterSetName = 'ByName')]
     param(
         [Parameter(Mandatory = $true, ParameterSetName = 'ByName', Position = 0)]
@@ -814,45 +1382,60 @@ function Set-PoshifyTheme {
         [Alias('Path', 'FullName')]
         [string]$ThemePath,
 
+        [Parameter(Mandatory = $true, ParameterSetName = 'Random')]
+        [switch]$Random,
+
+        [Parameter(ParameterSetName = 'Random')]
+        [switch]$FromFavorites,
+
         [switch]$NoApply
     )
 
     process {
-        $theme = Resolve-PoshifyThemeFile -Name $Name -ThemePath $ThemePath
-        if (-not $theme) {
-            return
-        }
-
         if (-not (Get-OhMyPoshCommand)) {
-            Write-Error -Message 'oh-my-posh is not installed or not in PATH. Install it from https://ohmyposh.dev/docs/installation' -Category NotInstalled
+            Write-Error -Message "oh-my-posh is not installed or not in PATH. Run 'Poshify setup' to install it, or see $script:OhMyPoshInstallUrl" -Category NotInstalled
             return
         }
 
-        $profilePath = Get-PoshifyProfilePath
-        if (-not $PSCmdlet.ShouldProcess($profilePath, "Set oh-my-posh theme to '$($theme.Name)'")) {
+        if ($Random) {
+            # Fails with a helpful error when there is nothing to pick from
+            if (-not (Get-PoshifyRandomTheme -FromFavorites:$FromFavorites)) {
+                return
+            }
+            $selection = if ($FromFavorites) { 'random:favorites' } else { 'random' }
+            $description = if ($FromFavorites) { 'a random favorite theme in each session' } else { 'a random theme in each session' }
+        }
+        else {
+            $theme = Resolve-PoshifyThemeFile -Name $Name -ThemePath $ThemePath -IncludeOnline
+            if (-not $theme) {
+                return
+            }
+
+            if (-not $theme.Path) {
+                # Only available online: download it first
+                Write-Verbose "Theme '$($theme.Name)' is not installed; downloading it"
+                $theme = Install-PoshifyTheme -Name $theme.Name
+                if (-not $theme) {
+                    return
+                }
+            }
+            $selection = $theme.Path
+            $description = "'$($theme.Name)'"
+        }
+
+        $profilePaths = (Get-PoshifyProfileTarget | ForEach-Object { $_.Path }) -join ', '
+        if (-not $PSCmdlet.ShouldProcess($profilePaths, "Set oh-my-posh theme to $description")) {
             return
         }
 
-        Write-PoshifyTextFile -Path (Get-PoshifyCurrentThemeFile) -Text $theme.Path
-
-        $original = if (Test-Path -LiteralPath $profilePath) { Read-PoshifyTextFile -Path $profilePath }
-        $content = Merge-PoshifyProfileBlock -Content $original.Text
-        if ($content -cne $original.Text) {
-            Write-Verbose "Updating Poshify block in $profilePath"
-            if ($original) {
-                Write-PoshifyTextFile -Path $profilePath -Text $content -Encoding $original.Encoding
-            }
-            else {
-                Write-PoshifyTextFile -Path $profilePath -Text $content
-            }
-        }
+        Write-PoshifyTextFile -Path (Get-PoshifyCurrentThemeFile) -Text $selection
+        Write-PoshifyProfileBlock
 
         if (-not $NoApply) {
-            # oh-my-posh's init script installs its prompt globally, so it can run from module scope
-            (Invoke-OhMyPosh -ArgumentList 'init', 'pwsh', '--config', $theme.Path) -join [Environment]::NewLine | Invoke-Expression
+            Invoke-PoshifyInitScript
         }
 
-        Write-Verbose "Theme set to '$($theme.Name)' ($($theme.Path))"
+        Write-Verbose "Theme set to $description"
     }
 }
 
@@ -861,7 +1444,7 @@ function Set-PoshifyTheme {
     Resets the PowerShell prompt to default
 
 .DESCRIPTION
-    Removes the Poshify block from your PowerShell profile, clears the theme selection, and
+    Removes the Poshify block from your PowerShell profiles, clears the theme selection, and
     unloads oh-my-posh from the current session. Any oh-my-posh setup in your profile that
     Poshify did not create is left untouched and reported as a warning.
 
@@ -876,31 +1459,293 @@ function Reset-PoshifyTheme {
     [CmdletBinding(SupportsShouldProcess)]
     param()
 
-    $profilePath = Get-PoshifyProfilePath
-    if (-not $PSCmdlet.ShouldProcess($profilePath, 'Remove Poshify theme configuration')) {
+    $profilePaths = @(Get-PoshifyProfileTarget | ForEach-Object { $_.Path } | Where-Object { Test-Path -LiteralPath $_ })
+    if (-not $PSCmdlet.ShouldProcess(($profilePaths -join ', '), 'Remove Poshify theme configuration')) {
         return
     }
 
-    if (Test-Path -LiteralPath $profilePath) {
-        $original = Read-PoshifyTextFile -Path $profilePath
-        $content = Merge-PoshifyProfileBlock -Content $original.Text -Remove
-        if ($content -cne $original.Text) {
-            Write-PoshifyTextFile -Path $profilePath -Text $content -Encoding $original.Encoding
-            Write-Verbose "Removed Poshify block from $profilePath"
-        }
-        else {
-            Write-Verbose "No Poshify block found in $profilePath"
-        }
+    Write-PoshifyProfileBlock -Remove
 
+    foreach ($profilePath in $profilePaths) {
         Select-String -LiteralPath $profilePath -Pattern 'oh-my-posh(\.exe)?[''"]?\s+init' | ForEach-Object {
-            Write-Warning "Your profile still initializes oh-my-posh outside Poshify (line $($_.LineNumber)): $($_.Line.Trim())"
+            Write-Warning "$profilePath still initializes oh-my-posh outside Poshify (line $($_.LineNumber)): $($_.Line.Trim())"
         }
     }
 
-    Remove-Item -LiteralPath (Get-PoshifyCurrentThemeFile) -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath (Get-PoshifyCurrentThemeFile), (Get-PoshifyInitScriptPath) -Force -ErrorAction SilentlyContinue
+    Clear-PoshifySessionPrompt
+}
 
-    # Unloading oh-my-posh's module restores the prompt it replaced
-    Get-Module -Name oh-my-posh-core | Remove-Module -Force
+function Resolve-PoshifyFolderPath {
+    param([string]$Path)
+
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if (-not $item -or -not $item.PSIsContainer -or $item.PSProvider.Name -ne 'FileSystem') {
+        Write-Error -Message "Folder not found: $Path" -Category ObjectNotFound -TargetObject $Path
+        return
+    }
+    $item.FullName
+}
+
+function Add-PoshifyTrust {
+    param([string]$File)
+
+    $trustFile = Join-Path $script:PoshifyHome 'trusted'
+    $entries = @(if (Test-Path -LiteralPath $trustFile) { Get-Content -LiteralPath $trustFile }) |
+        Where-Object { $_ -and -not $_.EndsWith(" $File") }
+    $hash = (Get-FileHash -LiteralPath $File -Algorithm SHA256).Hash
+    Write-PoshifyTextFile -Path $trustFile -Text (((@($entries) + "$hash $File") -join "`n") + "`n")
+}
+
+# Makes this session pick up a folder theme change at the next prompt
+function Sync-PoshifySessionTheme {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidGlobalVars', '', Justification = 'Session state shared with the generated init script')]
+    param()
+
+    if ($global:_poshifyUpdate) {
+        $global:_poshifyLastLocation = $null
+    }
+    else {
+        Invoke-PoshifyInitScript
+    }
+}
+
+<#
+.SYNOPSIS
+    Sets the theme for a folder
+
+.DESCRIPTION
+    Writes a .poshify file in the folder. Poshify uses that theme in the folder and everything
+    below it, instead of your default theme. The nearest .poshify file wins.
+
+    Existing .ompconfig files work the same way, so folders set up for other per-folder theme
+    scripts keep working.
+
+.PARAMETER Name
+    Theme name. Downloaded first if it isn't installed and exactly matches an online theme.
+
+.PARAMETER ThemePath
+    A theme file instead of a theme name, for example one kept in the project. It is stored
+    relative to the folder when it is inside it, and trusted (see Approve-PoshifyFolderTheme).
+
+.PARAMETER Path
+    The folder. Defaults to the current folder.
+
+.EXAMPLE
+    Set-PoshifyFolderTheme dracula
+    Uses the dracula theme in the current folder and below
+
+.EXAMPLE
+    Set-PoshifyFolderTheme -ThemePath .\tools\project.omp.json
+    Uses a theme file kept in the project
+
+.OUTPUTS
+    None
+#>
+function Set-PoshifyFolderTheme {
+    [CmdletBinding(SupportsShouldProcess, DefaultParameterSetName = 'ByName')]
+    param(
+        [Parameter(Mandatory = $true, Position = 0, ParameterSetName = 'ByName')]
+        [string]$Name,
+
+        [Parameter(Mandatory = $true, ParameterSetName = 'ByPath')]
+        [string]$ThemePath,
+
+        [string]$Path = '.'
+    )
+
+    $folder = Resolve-PoshifyFolderPath -Path $Path
+    if (-not $folder) {
+        return
+    }
+
+    $trust = $null
+    if ($PSCmdlet.ParameterSetName -eq 'ByPath') {
+        $item = Get-Item -LiteralPath $ThemePath -ErrorAction SilentlyContinue
+        if (-not $item -or $item.PSIsContainer) {
+            Write-Error -Message "Theme file not found: $ThemePath" -Category ObjectNotFound -TargetObject $ThemePath
+            return
+        }
+        $prefix = Join-Path $folder ''
+        $value = if ($item.FullName.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { $item.FullName.Substring($prefix.Length) } else { $item.FullName }
+        $display = "'$($item.Name)'"
+        $trust = $item.FullName
+    }
+    else {
+        $theme = Resolve-PoshifyThemeFile -Name $Name -IncludeOnline
+        if (-not $theme) {
+            return
+        }
+        if (-not $theme.Path) {
+            $theme = Install-PoshifyTheme -Name $theme.Name
+            if (-not $theme) {
+                return
+            }
+        }
+        $value = $theme.Name
+        $display = "'$($theme.Name)'"
+    }
+
+    $marker = Join-Path $folder '.poshify'
+    if (-not $PSCmdlet.ShouldProcess($marker, "Set folder theme to $display")) {
+        return
+    }
+
+    Write-PoshifyTextFile -Path $marker -Text "$value`n" -Encoding (New-Object System.Text.UTF8Encoding($false))
+    if ($trust) {
+        Add-PoshifyTrust -File $trust
+    }
+
+    # The profile block loads the init script that applies folder themes
+    Write-PoshifyProfileBlock
+    Sync-PoshifySessionTheme
+}
+
+<#
+.SYNOPSIS
+    Removes the theme set for a folder
+
+.DESCRIPTION
+    Deletes the .poshify (and .ompconfig) file in the folder. The folder then uses the theme of
+    the nearest parent folder that has one, or your default theme.
+
+.PARAMETER Path
+    The folder. Defaults to the current folder.
+
+.EXAMPLE
+    Clear-PoshifyFolderTheme
+    Removes the theme set for the current folder
+
+.OUTPUTS
+    None
+#>
+function Clear-PoshifyFolderTheme {
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [string]$Path = '.'
+    )
+
+    $folder = Resolve-PoshifyFolderPath -Path $Path
+    if (-not $folder) {
+        return
+    }
+
+    $markers = @('.poshify', '.ompconfig' | ForEach-Object { Join-Path $folder $_ } | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })
+    if ($markers.Count -eq 0) {
+        Write-Warning "No folder theme is set in $folder."
+    }
+    foreach ($marker in $markers) {
+        if ($PSCmdlet.ShouldProcess($marker, 'Remove folder theme')) {
+            Remove-Item -LiteralPath $marker -Force
+        }
+    }
+
+    if (-not $WhatIfPreference) {
+        $inherited = Resolve-PoshifyLocationTheme -Path $folder -PoshifyHome $script:PoshifyHome
+        if ($inherited) {
+            Write-Warning "This folder still gets a theme from $($inherited.Marker)."
+        }
+        Sync-PoshifySessionTheme
+    }
+}
+
+<#
+.SYNOPSIS
+    Shows the folder theme that applies to a folder
+
+.DESCRIPTION
+    Returns the theme set by the nearest .poshify (or .ompconfig) file at or above the folder,
+    with a Status of Active, Untrusted, NotFound or Empty. Returns nothing when no folder theme
+    applies, which means your default theme is used.
+
+.PARAMETER Path
+    The folder. Defaults to the current folder.
+
+.EXAMPLE
+    Get-PoshifyFolderTheme
+    Shows the folder theme for the current folder
+
+.OUTPUTS
+    Poshify.FolderTheme
+#>
+function Get-PoshifyFolderTheme {
+    [CmdletBinding()]
+    [OutputType('Poshify.FolderTheme')]
+    param(
+        [string]$Path = '.'
+    )
+
+    $folder = Resolve-PoshifyFolderPath -Path $Path
+    if (-not $folder) {
+        return
+    }
+
+    $result = Resolve-PoshifyLocationTheme -Path $folder -PoshifyHome $script:PoshifyHome
+    if (-not $result) {
+        Write-Verbose "No folder theme applies to $folder; your default theme is used."
+        return
+    }
+
+    [PSCustomObject]@{
+        PSTypeName = 'Poshify.FolderTheme'
+        Theme      = if ($result.File) { Get-PoshifyThemeName (Split-Path -Path $result.File -Leaf) } else { $result.Value }
+        Status     = $result.Status
+        Marker     = $result.Marker
+        ThemePath  = $result.File
+        Message    = $result.Message
+    }
+}
+
+<#
+.SYNOPSIS
+    Trusts the theme file used by a folder
+
+.DESCRIPTION
+    oh-my-posh themes can run commands, so a .poshify file that points to a theme file outside
+    your theme folders (for example one inside a cloned repository) is ignored until you trust
+    that file. Trust is tied to the file's content: if it changes, it must be trusted again.
+
+    Review the theme file before trusting it.
+
+.PARAMETER Path
+    The folder. Defaults to the current folder.
+
+.EXAMPLE
+    Approve-PoshifyFolderTheme
+    Trusts the theme file used by the current folder
+
+.OUTPUTS
+    None
+#>
+function Approve-PoshifyFolderTheme {
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [string]$Path = '.'
+    )
+
+    $folder = Resolve-PoshifyFolderPath -Path $Path
+    if (-not $folder) {
+        return
+    }
+
+    $result = Resolve-PoshifyLocationTheme -Path $folder -PoshifyHome $script:PoshifyHome
+    if (-not $result) {
+        Write-Error -Message "No .poshify or .ompconfig file applies to $folder." -Category ObjectNotFound -TargetObject $folder
+        return
+    }
+    if ($result.Status -eq 'Active') {
+        Write-Verbose "The theme for $folder is already usable."
+        return
+    }
+    if ($result.Status -ne 'Untrusted') {
+        Write-Error -Message $result.Message -Category ObjectNotFound -TargetObject $result.Marker
+        return
+    }
+
+    if ($PSCmdlet.ShouldProcess($result.File, 'Trust theme file')) {
+        Add-PoshifyTrust -File $result.File
+        Sync-PoshifySessionTheme
+    }
 }
 
 <#
@@ -909,9 +1754,10 @@ function Reset-PoshifyTheme {
 
 .DESCRIPTION
     Renders what the prompt looks like with a theme, without changing your current theme.
+    Themes that aren't installed can be previewed too; they are downloaded to a temporary file.
 
 .PARAMETER Name
-    The name of a local theme (see Get-PoshifyTheme).
+    The name of a local theme (see Get-PoshifyTheme), or the exact name of an online theme.
 
 .PARAMETER ThemePath
     Direct path to a theme file. Accepts pipeline input from Get-PoshifyTheme.
@@ -940,18 +1786,33 @@ function Show-PoshifyTheme {
     )
 
     process {
-        $theme = Resolve-PoshifyThemeFile -Name $Name -ThemePath $ThemePath
+        if (-not (Get-OhMyPoshCommand)) {
+            Write-Error -Message "oh-my-posh is not installed or not in PATH. Run 'Poshify setup' to install it, or see $script:OhMyPoshInstallUrl" -Category NotInstalled
+            return
+        }
+
+        $theme = Resolve-PoshifyThemeFile -Name $Name -ThemePath $ThemePath -IncludeOnline
         if (-not $theme) {
             return
         }
 
-        if (-not (Get-OhMyPoshCommand)) {
-            Write-Error -Message 'oh-my-posh is not installed or not in PATH. Install it from https://ohmyposh.dev/docs/installation' -Category NotInstalled
+        if ($theme.Path) {
+            "== $($theme.Name) =="
+            Invoke-OhMyPosh -ArgumentList 'print', 'preview', '--config', $theme.Path
             return
         }
 
-        "== $($theme.Name) =="
-        Invoke-OhMyPosh -ArgumentList 'print', 'preview', '--config', $theme.Path
+        # Not installed: preview from a temporary download
+        $previewPath = Join-Path ([IO.Path]::GetTempPath()) "poshify-preview-$([guid]::NewGuid().ToString('N'))-$($theme.FileName)"
+        try {
+            if (Save-PoshifyThemeFile -Theme $theme -Path $previewPath) {
+                "== $($theme.Name) (not installed) =="
+                Invoke-OhMyPosh -ArgumentList 'print', 'preview', '--config', $previewPath
+            }
+        }
+        finally {
+            Remove-Item -LiteralPath $previewPath -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 
@@ -1109,6 +1970,250 @@ function Get-PoshifyFavorite {
     Get-PoshifyFavoriteList
 }
 
+# Shows previews of a few popular themes and asks which one to use
+function Select-PoshifySetupTheme {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '', Justification = 'Interactive setup wizard')]
+    param([switch]$Interactive)
+
+    $choices = $script:SetupThemeChoices
+    if (-not $Interactive) {
+        return $script:DefaultTheme
+    }
+
+    Write-Host '  Popular themes:'
+    for ($i = 0; $i -lt $choices.Count; $i++) {
+        Write-Host ''
+        Write-Host ('  {0}. {1}' -f ($i + 1), $choices[$i]) -ForegroundColor Cyan
+        Show-PoshifyTheme -Name $choices[$i] -ErrorAction SilentlyContinue | Select-Object -Skip 1 | Out-Host
+    }
+
+    Write-Host ''
+    Write-Host "  Or type 'random' (or 'random-favorites') for a different theme in each session."
+    $answer = try { Read-Host "  Pick a number, or type any theme name (Enter for $($choices[0]))" } catch { '' }
+    $number = $answer -as [int]
+    if (-not $answer) { $choices[0] }
+    elseif ($number -ge 1 -and $number -le $choices.Count) { $choices[$number - 1] }
+    else { $answer.Trim() }
+}
+
+<#
+.SYNOPSIS
+    Sets up oh-my-posh and a Poshify theme in one go
+
+.DESCRIPTION
+    Walks through everything a working themed prompt needs and fixes what it can:
+
+    1. oh-my-posh: offers to install it (winget on Windows, Homebrew on macOS, the official
+       install script on Linux).
+    2. Nerd Font: offers to install Meslo Nerd Font, which most themes need for their icons.
+    3. Terminal font: offers to switch Windows Terminal's default font to that Nerd Font.
+    4. Execution policy: checks that each PowerShell edition can run your profile and explains
+       how to allow it if not. Poshify never changes the execution policy itself.
+    5. Theme: lets you pick a theme from previews (or uses -Theme) and sets it up in your profiles.
+
+    Steps that are already fine are skipped, so running it again is safe. Every change asks for
+    confirmation unless -Force is used, and -WhatIf shows what would change.
+
+.PARAMETER Theme
+    Theme to use instead of choosing from previews. Downloaded if it isn't installed.
+
+.PARAMETER Force
+    Apply every fix without asking. Without -Theme, keeps the current theme or uses the
+    oh-my-posh default theme.
+
+.PARAMETER SkipFont
+    Don't check or install fonts.
+
+.EXAMPLE
+    Initialize-Poshify
+    Interactive setup
+
+.EXAMPLE
+    Initialize-Poshify -Theme atomic -Force
+    Unattended setup with the atomic theme
+
+.OUTPUTS
+    None
+#>
+function Initialize-Poshify {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '', Justification = 'Interactive setup wizard')]
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [string]$Theme,
+        [switch]$Force,
+        [switch]$SkipFont
+    )
+
+    $report = {
+        param([string]$Status, [string]$Message)
+        $color = switch ($Status) { 'ok' { 'Green' } 'done' { 'Cyan' } 'skip' { 'DarkGray' } default { 'Yellow' } }
+        Write-Host ('  [{0,-4}] {1}' -f $Status, $Message) -ForegroundColor $color
+    }
+
+    # Honours -WhatIf/-Confirm, then asks unless -Force
+    $approve = {
+        param([string]$Target, [string]$Action, [string]$Question)
+        if (-not $PSCmdlet.ShouldProcess($Target, $Action)) {
+            return $false
+        }
+        if ($Force) {
+            return $true
+        }
+        try {
+            $PSCmdlet.ShouldContinue($Question, 'Poshify setup')
+        }
+        catch {
+            & $report 'skip' 'Cannot ask for confirmation in this session; run with -Force to apply fixes.'
+            $false
+        }
+    }
+
+    # 1. oh-my-posh
+    Write-Host 'oh-my-posh' -ForegroundColor White
+    if (-not (Get-OhMyPoshCommand)) {
+        $installer = Get-PoshifyOhMyPoshInstaller
+        if (-not $installer) {
+            & $report 'todo' "oh-my-posh is not installed and no supported installer was found. Install it from $script:OhMyPoshInstallUrl, then run setup again."
+            return
+        }
+        if (-not (& $approve 'oh-my-posh' "Install with $($installer.Description)" "oh-my-posh is not installed. Install it now with $($installer.Description)?")) {
+            & $report 'todo' "oh-my-posh is required. Install it from $script:OhMyPoshInstallUrl, then run setup again."
+            return
+        }
+
+        Invoke-PoshifyInstaller -Installer $installer
+        Sync-PoshifySessionPath
+        if (-not (Get-OhMyPoshCommand)) {
+            & $report 'todo' 'oh-my-posh was installed but is not on PATH yet. Open a new terminal and run setup again.'
+            return
+        }
+        & $report 'done' "Installed oh-my-posh with $($installer.Description)"
+        if (-not (Test-PoshifyWindows)) {
+            & $report 'info' 'Make sure the folder containing oh-my-posh is on PATH in new sessions too.'
+        }
+    }
+    & $report 'ok' "oh-my-posh $(Invoke-OhMyPosh -ArgumentList 'version')"
+
+    # 2. Fonts
+    Write-Host 'Font' -ForegroundColor White
+    if ($SkipFont) {
+        & $report 'skip' 'Font checks skipped'
+    }
+    else {
+        $fonts = @(Get-PoshifyNerdFont)
+        if ($fonts) {
+            $listed = ($fonts | Select-Object -First 3) -join ', '
+            if ($fonts.Count -gt 3) { $listed += " and $($fonts.Count - 3) more" }
+            & $report 'ok' "Nerd Fonts installed: $listed"
+        }
+        elseif (& $approve $script:NerdFontFamily 'Install font' "Most themes need a Nerd Font to show their icons. Install $script:NerdFontFamily now?") {
+            Invoke-OhMyPosh -ArgumentList 'font', 'install', $script:NerdFontName
+            $fonts = @(Get-PoshifyNerdFont)
+            if ($fonts) {
+                & $report 'done' "Installed $script:NerdFontFamily"
+            }
+            else {
+                & $report 'todo' "The font may need a new session to show up. If icons look like boxes, run: oh-my-posh font install $script:NerdFontName"
+            }
+        }
+        else {
+            & $report 'todo' "No Nerd Font found, so theme icons will show as boxes. Install one with: oh-my-posh font install $script:NerdFontName"
+        }
+
+        $face = if ($script:NerdFontFamily -in $fonts) { $script:NerdFontFamily } else { $fonts | Select-Object -First 1 }
+        if (-not $face) {
+            $face = $script:NerdFontFamily
+        }
+
+        $terminals = @(Get-PoshifyTerminalSettingsPath)
+        foreach ($settingsPath in $terminals) {
+            try {
+                $currentFace = Get-PoshifyTerminalFont -Path $settingsPath
+            }
+            catch {
+                & $report 'todo' "Could not read Windows Terminal settings ($settingsPath). Set its font to '$face' manually."
+                continue
+            }
+
+            if (Test-PoshifyNerdFontFace $currentFace) {
+                & $report 'ok' "Windows Terminal font: $currentFace"
+            }
+            elseif (-not $fonts) {
+                & $report 'todo' "Windows Terminal uses '$currentFace'. Switch it to a Nerd Font once one is installed."
+            }
+            elseif (& $approve $settingsPath "Set default font to '$face'" "Windows Terminal uses '$currentFace', which has no icons. Change its default font to '$face'? A backup of its settings is kept.") {
+                if (Write-PoshifyTerminalFont -Path $settingsPath -Face $face) {
+                    & $report 'done' "Windows Terminal font set to '$face' (backup: $settingsPath.poshify-backup)"
+                }
+            }
+            else {
+                & $report 'todo' "Windows Terminal uses '$currentFace'. Set its font to '$face' to see theme icons."
+            }
+        }
+
+        if ($env:TERM_PROGRAM -eq 'vscode') {
+            & $report 'info' "In VS Code, set ""terminal.integrated.fontFamily"" to '$face' to see theme icons in its terminal."
+        }
+        elseif (-not $terminals) {
+            & $report 'info' "Make sure your terminal's font is a Nerd Font such as '$face'."
+        }
+    }
+
+    # 3. Execution policy
+    Write-Host 'Execution policy' -ForegroundColor White
+    foreach ($target in Get-PoshifyProfileTarget) {
+        $policy = Get-PoshifyExecutionPolicy -Edition $target.Edition
+        if (Test-PoshifyPolicyBlocksProfile $policy) {
+            & $report 'todo' (Get-PoshifyPolicyAdvice -Edition $target.Edition -Policy $policy)
+        }
+        else {
+            & $report 'ok' "$(Get-PoshifyEditionName $target.Edition) can run your profile ($policy)"
+        }
+    }
+
+    # 4. Theme
+    Write-Host 'Theme' -ForegroundColor White
+    $selection = Get-PoshifyCurrentThemePath
+    $choice = if ($Theme) {
+        $Theme
+    }
+    elseif ($selection -like 'random*') {
+        & $report 'ok' "Keeping random themes. Use 'Poshify theme set <name>' to pick a fixed one."
+        $selection
+    }
+    elseif ($selection -and (Test-Path -LiteralPath $selection)) {
+        & $report 'ok' "Keeping your default theme '$(Get-PoshifyThemeName (Split-Path -Path $selection -Leaf))'. Use 'Poshify theme set <name>' to change it."
+        $selection
+    }
+    else {
+        Select-PoshifySetupTheme -Interactive:(-not $Force)
+    }
+
+    $setParameters = switch -Regex ($choice) {
+        '^random(-favorites|:favorites)$' { @{ Random = $true; FromFavorites = $true }; break }
+        '^random$' { @{ Random = $true }; break }
+        '[\\/]' { @{ ThemePath = $choice }; break }
+        default { @{ Name = $choice } }
+    }
+
+    Set-PoshifyTheme @setParameters -ErrorVariable setError
+    if ($setError -or $WhatIfPreference) {
+        return
+    }
+
+    foreach ($target in Get-PoshifyProfileTarget) {
+        $name = Get-PoshifyEditionName $target.Edition
+        if ((Test-Path -LiteralPath $target.Path) -and (Select-String -LiteralPath $target.Path -SimpleMatch $script:ProfileBlockStart -Quiet)) {
+            & $report 'ok' "$name profile loads the theme ($($target.Path))"
+        }
+        else {
+            & $report 'skip' "$name profile not set up (its execution policy doesn't allow profiles)"
+        }
+    }
+    $summary = if ($setParameters.Random) { 'a random theme in each new session' } else { "'$(Get-PoshifyThemeName (Split-Path -Path (Get-PoshifyCurrentThemePath) -Leaf))'" }
+    & $report 'done' "Default theme: $summary. Folders with a .poshify file use their own theme ('Poshify folder set <name>')."
+}
+
 # Create CLI-friendly aliases for common operations
 New-Alias -Name 'poshify-theme-get' -Value 'Get-PoshifyTheme' -ErrorAction SilentlyContinue
 New-Alias -Name 'poshify-theme-find' -Value 'Find-PoshifyTheme' -ErrorAction SilentlyContinue
@@ -1132,8 +2237,16 @@ function Poshify {
     .DESCRIPTION
         Provides a command-line interface for managing oh-my-posh themes.
 
+        Setup:            Poshify setup (installs and configures everything; see Initialize-Poshify)
         Theme actions:    list, find, install, set, reset, current, show, update, remove, random
         Favorite actions: list, add, remove, random
+        Folder actions:   set, clear, show, trust (theme for the current folder and below)
+
+        'Poshify theme set random' (or random-favorites) uses a different theme in each session.
+
+    .EXAMPLE
+        Poshify setup
+        Installs oh-my-posh and a Nerd Font if needed, and sets up a theme
 
     .EXAMPLE
         Poshify theme install agnoster
@@ -1167,22 +2280,33 @@ function Poshify {
     [CmdletBinding()]
     param(
         [Parameter(Position = 0, Mandatory = $true)]
-        [ValidateSet('theme', 'favorite')]
+        [ValidateSet('theme', 'favorite', 'folder', 'setup')]
         [string]$Command,
 
-        [Parameter(Position = 1, Mandatory = $true)]
-        [ValidateSet('list', 'find', 'install', 'set', 'reset', 'current', 'show', 'update', 'remove', 'random', 'add')]
+        [Parameter(Position = 1)]
+        [ValidateSet('list', 'find', 'install', 'set', 'reset', 'current', 'show', 'update', 'remove', 'random', 'add', 'clear', 'trust')]
         [string]$Action,
 
         [Parameter(Position = 2)]
         [string]$ThemeName
     )
 
+    if ($Command -eq 'setup') {
+        Initialize-Poshify
+        return
+    }
+
     $actions = @{
         theme    = 'list', 'find', 'install', 'set', 'reset', 'current', 'show', 'update', 'remove', 'random'
         favorite = 'list', 'add', 'remove', 'random'
+        folder   = 'set', 'clear', 'show', 'trust'
     }
-    $needsName = 'theme install', 'theme set', 'theme show', 'theme remove', 'favorite add', 'favorite remove'
+    $needsName = 'theme install', 'theme set', 'theme show', 'theme remove', 'favorite add', 'favorite remove', 'folder set'
+
+    if (-not $Action) {
+        Write-Error "Missing action for '$Command'. Available actions: $($actions[$Command] -join ', ')"
+        return
+    }
 
     if ($Action -notin $actions[$Command]) {
         Write-Error "Unknown action '$Action' for '$Command'. Available actions: $($actions[$Command] -join ', ')"
@@ -1213,9 +2337,20 @@ function Poshify {
             }
         }
         'theme set' {
-            Set-PoshifyTheme -Name $ThemeName -ErrorVariable setError
+            if ($ThemeName -in 'random', 'random-favorites') {
+                Set-PoshifyTheme -Random -FromFavorites:($ThemeName -eq 'random-favorites') -ErrorVariable setError
+                $message = 'New sessions will each use a random theme.'
+            }
+            else {
+                Set-PoshifyTheme -Name $ThemeName -ErrorVariable setError
+                $message = "Default theme set to '$ThemeName'."
+            }
             if (-not $setError) {
-                Write-Host "Theme set to '$ThemeName'." -ForegroundColor Green
+                Write-Host $message -ForegroundColor Green
+                $folderTheme = Get-PoshifyFolderTheme
+                if ($folderTheme) {
+                    Write-Host "This folder uses its own theme '$($folderTheme.Theme)' from $($folderTheme.Marker)." -ForegroundColor Yellow
+                }
             }
         }
         'theme reset' {
@@ -1224,10 +2359,39 @@ function Poshify {
         }
         'theme current' {
             $theme = Get-PoshifyCurrentTheme
-            if (-not $theme) {
+            if ($theme) {
+                Write-Host "$($theme.Name) - $($theme.SelectedBy)" -ForegroundColor Green
+            }
+            elseif ((Get-PoshifyCurrentThemePath) -like 'random*') {
+                Write-Host 'A random theme is picked when each session starts.' -ForegroundColor Yellow
+            }
+            else {
                 Write-Host 'No theme is selected. Use "Poshify theme set <name>" to select one.' -ForegroundColor Yellow
             }
-            $theme
+        }
+        'folder set' {
+            Set-PoshifyFolderTheme -Name $ThemeName -ErrorVariable setError
+            if (-not $setError) {
+                Write-Host "This folder and everything below it now use '$ThemeName'." -ForegroundColor Green
+            }
+        }
+        'folder clear' {
+            Clear-PoshifyFolderTheme
+        }
+        'folder show' {
+            $folderTheme = Get-PoshifyFolderTheme
+            if (-not $folderTheme) {
+                Write-Host 'No folder theme applies here; your default theme is used.' -ForegroundColor Yellow
+            }
+            elseif ($folderTheme.Status -eq 'Active') {
+                Write-Host "$($folderTheme.Theme) (from $($folderTheme.Marker))" -ForegroundColor Green
+            }
+            else {
+                Write-Host "$($folderTheme.Status): $($folderTheme.Message)" -ForegroundColor Yellow
+            }
+        }
+        'folder trust' {
+            Approve-PoshifyFolderTheme
         }
         'theme show' {
             Show-PoshifyTheme -Name $ThemeName
@@ -1276,7 +2440,7 @@ $localThemeCompleter = {
             return
         }
         # Install and find work with online themes; don't suggest local names there
-        if ($command -notin 'theme set', 'theme show', 'theme update', 'theme remove', 'favorite add') {
+        if ($command -notin 'theme set', 'theme show', 'theme update', 'theme remove', 'favorite add', 'folder set') {
             return
         }
     }
@@ -1290,7 +2454,7 @@ $favoriteCompleter = {
     Get-PoshifyFavorite | Where-Object { $_ -like "$wordToComplete*" }
 }
 Register-ArgumentCompleter -ParameterName 'Name' -ScriptBlock $localThemeCompleter -CommandName @(
-    'Get-PoshifyTheme', 'Set-PoshifyTheme', 'Show-PoshifyTheme', 'Update-PoshifyTheme', 'Remove-PoshifyTheme', 'Add-PoshifyFavorite'
+    'Get-PoshifyTheme', 'Set-PoshifyTheme', 'Show-PoshifyTheme', 'Update-PoshifyTheme', 'Remove-PoshifyTheme', 'Add-PoshifyFavorite', 'Set-PoshifyFolderTheme'
 )
 Register-ArgumentCompleter -CommandName 'Remove-PoshifyFavorite' -ParameterName 'Name' -ScriptBlock $favoriteCompleter
 Register-ArgumentCompleter -CommandName 'Poshify' -ParameterName 'ThemeName' -ScriptBlock $localThemeCompleter
@@ -1310,6 +2474,11 @@ Export-ModuleMember -Function @(
     'Add-PoshifyFavorite',
     'Remove-PoshifyFavorite',
     'Get-PoshifyFavorite',
+    'Initialize-Poshify',
+    'Set-PoshifyFolderTheme',
+    'Clear-PoshifyFolderTheme',
+    'Get-PoshifyFolderTheme',
+    'Approve-PoshifyFolderTheme',
     'Poshify'
 ) -Alias @(
     'poshify-theme-get',

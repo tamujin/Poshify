@@ -14,6 +14,29 @@ to the PowerShell Gallery; its new commands were not exported by the module, so 
 release where they are usable.
 
 ### Added
+- `Poshify setup` / `Initialize-Poshify`: one command that installs oh-my-posh (winget, Homebrew or
+  the official script) and Meslo Nerd Font if missing, switches Windows Terminal's default font to
+  the Nerd Font (keeping a backup of its settings), checks that each PowerShell edition can run your
+  profile, and sets a theme picked from previews. Safe to re-run; supports `-Force` and `-WhatIf`.
+- On Windows, `Set-PoshifyTheme` sets up both the PowerShell 7 and Windows PowerShell profiles. A
+  missing profile for the other edition is only created when its execution policy lets it run.
+- `Set-PoshifyTheme` warns when an execution policy will stop the profile from loading, and shows the
+  `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` command to allow it. Poshify never changes
+  the policy itself.
+- Per-folder themes: a `.poshify` file sets the theme for a folder and everything below it, and
+  existing `.ompconfig` files are honoured too. Managed with `Set-`, `Clear-`, `Get-` and
+  `Approve-PoshifyFolderTheme` (`Poshify folder set|clear|show|trust`). A folder file that points to
+  a theme file outside your theme folders is ignored until trusted, because themes can run commands;
+  trust is tied to the file's content.
+- `Set-PoshifyTheme -Random [-FromFavorites]` (`Poshify theme set random`): a different theme in
+  every new session.
+- `Get-PoshifyCurrentTheme` reports the theme for the current folder (or `-Path`) and a
+  `SelectedBy` property saying whether it comes from a folder file, the default or a random pick.
+- The profile block now loads a generated `~/.poshthemes/init.ps1`, which applies folder themes
+  without loading the module and passes the last command's status and exit code through to
+  oh-my-posh. Poshify updates that file itself, so later versions don't need to edit your profile.
+- `Set-PoshifyTheme` downloads a theme that isn't installed when its name exactly matches an online theme.
+- `Show-PoshifyTheme` previews themes that aren't installed, using a temporary download.
 - `Get-PoshifyCurrentTheme`: the theme selected with `Set-PoshifyTheme`.
 - `Update-PoshifyTheme [-Name | -All]`: re-downloads themes whose content changed upstream,
   detected by comparing git blob hashes (no extra requests).

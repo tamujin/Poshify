@@ -49,6 +49,11 @@
         'Add-PoshifyFavorite',
         'Remove-PoshifyFavorite',
         'Get-PoshifyFavorite',
+        'Initialize-Poshify',
+        'Set-PoshifyFolderTheme',
+        'Clear-PoshifyFolderTheme',
+        'Get-PoshifyFolderTheme',
+        'Approve-PoshifyFolderTheme',
         'Poshify'
     )
     
@@ -112,6 +117,18 @@ Profile handling
 - Reset-PoshifyTheme no longer edits oh-my-posh setup it did not create
 - Profile encoding and line endings are preserved
 - Set-PoshifyTheme applies the theme to the current session immediately
+
+Setup
+- Poshify setup (Initialize-Poshify): installs oh-my-posh and a Nerd Font if missing, switches the
+  Windows Terminal font, checks execution policies and sets a theme picked from previews
+- Both PowerShell 7 and Windows PowerShell profiles are set up on Windows
+- Set-PoshifyTheme downloads themes that aren't installed yet; Show-PoshifyTheme previews them
+
+Per-folder themes
+- A .poshify file sets the theme for a folder and everything below it; .ompconfig files work too
+- Set-, Clear-, Get-, Approve-PoshifyFolderTheme (Poshify folder set|clear|show|trust)
+- Theme files outside your theme folders must be trusted first, since themes can run commands
+- Set-PoshifyTheme -Random [-FromFavorites]: a different theme in every new session
 
 New commands
 - Get-PoshifyCurrentTheme: the selected theme

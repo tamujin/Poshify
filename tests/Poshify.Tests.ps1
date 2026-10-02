@@ -28,11 +28,23 @@ Describe 'Poshify' {
             param($Path)
             $script:PoshifyHome = $Path
         }
-        Mock Get-PoshifyProfilePath -ModuleName Poshify { Join-Path $TestDrive 'Documents/PowerShell/profile.ps1' }
+        Mock Get-PoshifyProfileTarget -ModuleName Poshify {
+            [PSCustomObject]@{ Edition = 'Core'; Path = (Join-Path $TestDrive 'Documents/PowerShell/profile.ps1'); IsCurrent = $true }
+        }
+        Mock Get-PoshifyExecutionPolicy -ModuleName Poshify { 'RemoteSigned' }
         Mock Get-OhMyPoshCommand -ModuleName Poshify { [PSCustomObject]@{ Name = 'oh-my-posh' } }
+        Mock Invoke-PoshifyInitScript -ModuleName Poshify { }
+
+        # Folder themes are looked up from the current folder; keep real .poshify/.ompconfig files out of it
+        Push-Location -LiteralPath $TestDrive
+
+        # No network in tests: online lookups find nothing unless a context mocks them
+        Mock Invoke-RestMethod -ModuleName Poshify { @() }
+        Mock Invoke-WebRequest -ModuleName Poshify { throw 'Network access is disabled in tests' }
     }
 
     AfterEach {
+        Pop-Location
         $env:POSH_THEMES_PATH = $script:savedThemesPath
     }
 
@@ -586,6 +598,605 @@ Describe 'Poshify' {
             foreach ($name in @($manifest.FunctionsToExport) + @($manifest.AliasesToExport)) {
                 $exported | Should -Contain $name
             }
+        }
+    }
+
+    Context 'Profiles for both PowerShell editions' {
+        BeforeEach {
+            New-ThemeFile -Directory $script:bundled -FileName 'agnoster.omp.json'
+            $script:desktopProfile = Join-Path $TestDrive 'Documents/WindowsPowerShell/profile.ps1'
+            Mock Get-PoshifyProfileTarget -ModuleName Poshify {
+                [PSCustomObject]@{ Edition = 'Core'; Path = (Join-Path $TestDrive 'Documents/PowerShell/profile.ps1'); IsCurrent = $true }
+                [PSCustomObject]@{ Edition = 'Desktop'; Path = (Join-Path $TestDrive 'Documents/WindowsPowerShell/profile.ps1'); IsCurrent = $false }
+            }
+        }
+
+        It 'sets up the other edition too when it can run scripts' {
+            Set-PoshifyTheme -Name 'agnoster' -NoApply
+            Get-Content -LiteralPath $script:profilePath -Raw | Should -Match '# >>> poshify >>>'
+            Get-Content -LiteralPath $script:desktopProfile -Raw | Should -Match '# >>> poshify >>>'
+        }
+
+        It 'does not create a profile for an edition that cannot run scripts' {
+            Mock Get-PoshifyExecutionPolicy -ModuleName Poshify -ParameterFilter { $Edition -eq 'Desktop' } { 'Restricted' }
+            Set-PoshifyTheme -Name 'agnoster' -NoApply -WarningVariable warnings
+            $script:desktopProfile | Should -Not -Exist
+            $warnings | Should -BeNullOrEmpty
+        }
+
+        It 'updates an existing profile it cannot run and explains how to allow it' {
+            New-Item -ItemType Directory -Path (Split-Path $script:desktopProfile) -Force | Out-Null
+            Set-Content -LiteralPath $script:desktopProfile -Value 'Import-Module posh-git'
+            Mock Get-PoshifyExecutionPolicy -ModuleName Poshify -ParameterFilter { $Edition -eq 'Desktop' } { 'Restricted' }
+
+            Set-PoshifyTheme -Name 'agnoster' -NoApply -WarningVariable warnings -WarningAction SilentlyContinue
+
+            Get-Content -LiteralPath $script:desktopProfile -Raw | Should -Match '# >>> poshify >>>'
+            "$warnings" | Should -Match 'Windows PowerShell can''t run your profile because its execution policy is Restricted'
+            "$warnings" | Should -Match 'Set-ExecutionPolicy -Scope CurrentUser RemoteSigned'
+        }
+
+        It 'warns when the current edition cannot run scripts' {
+            Mock Get-PoshifyExecutionPolicy -ModuleName Poshify -ParameterFilter { $Edition -eq 'Core' } { 'AllSigned' }
+            Set-PoshifyTheme -Name 'agnoster' -NoApply -WarningVariable warnings -WarningAction SilentlyContinue
+            $script:profilePath | Should -Exist
+            "$warnings" | Should -Match 'PowerShell 7 can''t run your profile'
+        }
+
+        It 'only checks the execution policy when a profile changes' {
+            Set-PoshifyTheme -Name 'agnoster' -NoApply
+            Set-PoshifyTheme -Name 'agnoster' -NoApply
+            Should -Invoke Get-PoshifyExecutionPolicy -ModuleName Poshify -Times 2 -Exactly
+        }
+
+        It 'resets both profiles' {
+            Set-PoshifyTheme -Name 'agnoster' -NoApply
+            Reset-PoshifyTheme
+            Get-Content -LiteralPath $script:profilePath -Raw | Should -Not -Match 'poshify'
+            Get-Content -LiteralPath $script:desktopProfile -Raw | Should -Not -Match 'poshify'
+        }
+    }
+
+    Context 'Themes that are only available online' {
+        BeforeEach {
+            Mock Get-PoshifyOnlineThemeList -ModuleName Poshify {
+                [PSCustomObject]@{ PSTypeName = 'Poshify.OnlineTheme'; Name = 'atomic'; FileName = 'atomic.omp.json'; DownloadUrl = 'https://example.test/atomic.omp.json'; Sha = 'x' }
+            }
+            Mock Invoke-WebRequest -ModuleName Poshify { Set-Content -LiteralPath $OutFile -Value '{}' }
+            Mock Invoke-OhMyPosh -ModuleName Poshify { $global:PoshifyTestPreviewPath = $ArgumentList[-1]; 'preview' }
+        }
+
+        AfterEach {
+            Remove-Variable -Name PoshifyTestPreviewPath -Scope Global -ErrorAction SilentlyContinue
+        }
+
+        It 'Set-PoshifyTheme downloads an exact online match first' {
+            Set-PoshifyTheme -Name 'atomic' -NoApply
+            Join-Path $script:home_ 'atomic.omp.json' | Should -Exist
+            (Get-PoshifyCurrentTheme).Name | Should -Be 'atomic'
+        }
+
+        It 'Set-PoshifyTheme does not download partial online matches' {
+            Set-PoshifyTheme -Name 'atom' -NoApply -ErrorVariable err -ErrorAction SilentlyContinue
+            "$err" | Should -Match 'not found locally or online'
+            Should -Invoke Invoke-WebRequest -ModuleName Poshify -Times 0 -Exactly
+        }
+
+        It 'Set-PoshifyTheme -WhatIf downloads nothing' {
+            Set-PoshifyTheme -Name 'atomic' -WhatIf
+            Join-Path $script:home_ 'atomic.omp.json' | Should -Not -Exist
+            Join-Path $script:home_ 'current' | Should -Not -Exist
+        }
+
+        It 'Show-PoshifyTheme previews from a temporary download' {
+            $output = Show-PoshifyTheme -Name 'atomic'
+            $output[0] | Should -Be '== atomic (not installed) =='
+            $global:PoshifyTestPreviewPath | Should -BeLike '*poshify-preview-*atomic.omp.json'
+            $global:PoshifyTestPreviewPath | Should -Not -Exist
+            Join-Path $script:home_ 'atomic.omp.json' | Should -Not -Exist
+        }
+    }
+
+    Context 'Windows Terminal font' -Skip:($PSVersionTable.PSEdition -ne 'Core') {
+        BeforeEach {
+            $script:settings = Join-Path $TestDrive 'settings.json'
+        }
+
+        It 'sets the default font and keeps everything else' {
+            Set-Content -LiteralPath $script:settings -Value '{
+                "defaultProfile": "{61c54bbd-c2c6-5271-96e7-009a87ff44bf}",
+                "profiles": {
+                    "defaults": { "font": { "face": "Cascadia Mono", "size": 11 }, "opacity": 90 },
+                    "list": [ { "name": "Windows PowerShell", "hidden": false } ]
+                },
+                "schemes": [],
+                "actions": [ { "command": "paste", "keys": "ctrl+v" } ]
+            }'
+
+            InModuleScope Poshify -Parameters @{ Path = $script:settings } {
+                param($Path)
+                Get-PoshifyTerminalFont -Path $Path | Should -Be 'Cascadia Mono'
+                Write-PoshifyTerminalFont -Path $Path -Face 'MesloLGM Nerd Font' | Should -BeTrue
+                Get-PoshifyTerminalFont -Path $Path | Should -Be 'MesloLGM Nerd Font'
+            }
+
+            $result = Get-Content -LiteralPath $script:settings -Raw | ConvertFrom-Json
+            $result.profiles.defaults.font.size | Should -Be 11
+            $result.profiles.defaults.opacity | Should -Be 90
+            $result.profiles.list[0].name | Should -Be 'Windows PowerShell'
+            $result.actions[0].keys | Should -Be 'ctrl+v'
+            "$($script:settings).poshify-backup" | Should -Exist
+            (Get-Content -LiteralPath "$($script:settings).poshify-backup" -Raw) | Should -Match 'Cascadia Mono'
+        }
+
+        It 'adds the font setting when there is none' {
+            Set-Content -LiteralPath $script:settings -Value '{ "profiles": { "list": [] } }'
+            InModuleScope Poshify -Parameters @{ Path = $script:settings } {
+                param($Path)
+                Get-PoshifyTerminalFont -Path $Path | Should -Be 'Cascadia Mono'
+                Write-PoshifyTerminalFont -Path $Path -Face 'MesloLGM Nerd Font' | Should -BeTrue
+                Get-PoshifyTerminalFont -Path $Path | Should -Be 'MesloLGM Nerd Font'
+            }
+        }
+
+        It 'leaves settings with comments alone' {
+            $original = "{`n  // my settings`n  `"profiles`": { `"defaults`": {} }`n}"
+            Set-Content -LiteralPath $script:settings -Value $original -NoNewline
+            InModuleScope Poshify -Parameters @{ Path = $script:settings } {
+                param($Path)
+                Write-PoshifyTerminalFont -Path $Path -Face 'MesloLGM Nerd Font' -WarningAction SilentlyContinue | Should -BeFalse
+            }
+            Get-Content -LiteralPath $script:settings -Raw | Should -BeExactly $original
+        }
+
+        It 'warns about profiles that override the font' {
+            Set-Content -LiteralPath $script:settings -Value '{ "profiles": { "defaults": {}, "list": [ { "name": "Ubuntu", "font": { "face": "Consolas" } } ] } }'
+            InModuleScope Poshify -Parameters @{ Path = $script:settings } {
+                param($Path)
+                Write-PoshifyTerminalFont -Path $Path -Face 'MesloLGM Nerd Font' -WarningVariable warnings -WarningAction SilentlyContinue | Out-Null
+                "$warnings" | Should -Match 'Ubuntu'
+            }
+        }
+    }
+
+    Context 'Initialize-Poshify' {
+        BeforeEach {
+            New-ThemeFile -Directory $script:bundled -FileName 'agnoster.omp.json', 'jandedobbeleer.omp.json'
+            $global:PoshifyTestOutput = [System.Collections.Generic.List[string]]::new()
+            Mock Write-Host -ModuleName Poshify { $global:PoshifyTestOutput.Add("$Object") }
+            Mock Get-PoshifyNerdFont -ModuleName Poshify { 'MesloLGM Nerd Font' }
+            Mock Get-PoshifyTerminalSettingsPath -ModuleName Poshify { }
+            Mock Invoke-OhMyPosh -ModuleName Poshify { if ($ArgumentList[0] -eq 'version') { 'v-test' } }
+            Mock Invoke-PoshifyInstaller -ModuleName Poshify { }
+            Mock Sync-PoshifySessionPath -ModuleName Poshify { }
+        }
+
+        AfterEach {
+            Remove-Variable -Name PoshifyTestOutput, PoshifyTestCalls -Scope Global -ErrorAction SilentlyContinue
+        }
+
+        It 'sets the requested theme and applies it to the session' {
+            Initialize-Poshify -Theme 'agnoster' -Force
+            (Get-PoshifyCurrentTheme).Name | Should -Be 'agnoster'
+            Get-Content -LiteralPath $script:profilePath -Raw | Should -Match '# >>> poshify >>>'
+            $global:PoshifyTestOutput -join "`n" | Should -Match 'Default theme: ''agnoster'''
+            Should -Invoke Invoke-PoshifyInitScript -ModuleName Poshify -Times 1 -Exactly
+        }
+
+
+        It 'uses the oh-my-posh default theme when unattended' {
+            Initialize-Poshify -Force
+            (Get-PoshifyCurrentTheme).Name | Should -Be 'jandedobbeleer'
+        }
+
+        It 'keeps the current theme when run again' {
+            Set-PoshifyTheme -Name 'agnoster' -NoApply
+            Initialize-Poshify -Force
+            (Get-PoshifyCurrentTheme).Name | Should -Be 'agnoster'
+        }
+
+        It 'installs oh-my-posh when it is missing' {
+            $global:PoshifyTestCalls = 0
+            Mock Get-OhMyPoshCommand -ModuleName Poshify {
+                $global:PoshifyTestCalls++
+                if ($global:PoshifyTestCalls -gt 1) { [PSCustomObject]@{ Name = 'oh-my-posh' } }
+            }
+            Mock Get-PoshifyOhMyPoshInstaller -ModuleName Poshify { [PSCustomObject]@{ Description = 'test installer'; FilePath = 'x'; ArgumentList = @() } }
+
+            Initialize-Poshify -Theme 'agnoster' -Force
+
+            Should -Invoke Invoke-PoshifyInstaller -ModuleName Poshify -Times 1 -Exactly
+            Should -Invoke Sync-PoshifySessionPath -ModuleName Poshify -Times 1 -Exactly
+            (Get-PoshifyCurrentTheme).Name | Should -Be 'agnoster'
+        }
+
+        It 'stops with guidance when oh-my-posh cannot be installed' {
+            Mock Get-OhMyPoshCommand -ModuleName Poshify { }
+            Mock Get-PoshifyOhMyPoshInstaller -ModuleName Poshify { }
+
+            Initialize-Poshify -Theme 'agnoster' -Force
+
+            $global:PoshifyTestOutput -join "`n" | Should -Match 'ohmyposh.dev'
+            Get-PoshifyCurrentTheme | Should -BeNullOrEmpty
+        }
+
+        It 'installs a Nerd Font when none is present' {
+            $global:PoshifyTestCalls = 0
+            Mock Get-PoshifyNerdFont -ModuleName Poshify {
+                $global:PoshifyTestCalls++
+                if ($global:PoshifyTestCalls -gt 1) { 'MesloLGM Nerd Font' }
+            }
+
+            Initialize-Poshify -Theme 'agnoster' -Force
+
+            Should -Invoke Invoke-OhMyPosh -ModuleName Poshify -Times 1 -Exactly -ParameterFilter { $ArgumentList -contains 'font' -and $ArgumentList -contains 'Meslo' }
+        }
+
+        It 'skips fonts with -SkipFont' {
+            Initialize-Poshify -Theme 'agnoster' -Force -SkipFont
+            Should -Invoke Get-PoshifyNerdFont -ModuleName Poshify -Times 0 -Exactly
+        }
+
+        It 'switches Windows Terminal to the Nerd Font' {
+            Mock Get-PoshifyTerminalSettingsPath -ModuleName Poshify { 'C:\fake\settings.json' }
+            Mock Get-PoshifyTerminalFont -ModuleName Poshify { 'Cascadia Mono' }
+            Mock Write-PoshifyTerminalFont -ModuleName Poshify { $true }
+
+            Initialize-Poshify -Theme 'agnoster' -Force
+
+            Should -Invoke Write-PoshifyTerminalFont -ModuleName Poshify -Times 1 -Exactly -ParameterFilter { $Face -eq 'MesloLGM Nerd Font' }
+        }
+
+        It 'leaves a Windows Terminal that already uses a Nerd Font alone' {
+            Mock Get-PoshifyTerminalSettingsPath -ModuleName Poshify { 'C:\fake\settings.json' }
+            Mock Get-PoshifyTerminalFont -ModuleName Poshify { 'FiraCode Nerd Font' }
+            Mock Write-PoshifyTerminalFont -ModuleName Poshify { $true }
+
+            Initialize-Poshify -Theme 'agnoster' -Force
+
+            Should -Invoke Write-PoshifyTerminalFont -ModuleName Poshify -Times 0 -Exactly
+        }
+
+        It 'explains a blocking execution policy without changing it' {
+            Mock Get-PoshifyExecutionPolicy -ModuleName Poshify { 'Restricted' }
+            Initialize-Poshify -Theme 'agnoster' -Force -WarningAction SilentlyContinue
+            $global:PoshifyTestOutput -join "`n" | Should -Match 'Set-ExecutionPolicy -Scope CurrentUser RemoteSigned'
+        }
+
+        It 'changes nothing with -WhatIf' {
+            Mock Get-PoshifyNerdFont -ModuleName Poshify { }
+            Mock Get-PoshifyTerminalSettingsPath -ModuleName Poshify { 'C:\fake\settings.json' }
+            Mock Get-PoshifyTerminalFont -ModuleName Poshify { 'Cascadia Mono' }
+            Mock Write-PoshifyTerminalFont -ModuleName Poshify { $true }
+
+            Initialize-Poshify -Theme 'agnoster' -WhatIf
+
+            Should -Invoke Invoke-OhMyPosh -ModuleName Poshify -Times 0 -Exactly -ParameterFilter { $ArgumentList -contains 'font' }
+            Should -Invoke Write-PoshifyTerminalFont -ModuleName Poshify -Times 0 -Exactly
+            $script:profilePath | Should -Not -Exist
+            Join-Path $script:home_ 'current' | Should -Not -Exist
+        }
+
+        It 'is available as "Poshify setup"' {
+            Mock Initialize-Poshify -ModuleName Poshify { }
+            Poshify setup
+            Should -Invoke Initialize-Poshify -ModuleName Poshify -Times 1 -Exactly
+        }
+    }
+
+    Context 'Folder theme resolution' {
+        BeforeEach {
+            New-ThemeFile -Directory $script:home_ -FileName 'atomic.omp.json', 'dracula.omp.yaml'
+            New-ThemeFile -Directory $script:bundled -FileName 'agnoster.omp.json'
+            $script:project = Join-Path $TestDrive 'projects/app'
+            $script:nested = Join-Path $script:project 'src/lib'
+            New-Item -ItemType Directory -Path $script:nested -Force | Out-Null
+
+            function script:Resolve-Test {
+                param([string]$Path)
+                InModuleScope Poshify -Parameters @{ Path = $Path; PoshifyHome = $script:home_ } {
+                    param($Path, $PoshifyHome)
+                    Resolve-PoshifyLocationTheme -Path $Path -PoshifyHome $PoshifyHome
+                }
+            }
+        }
+
+        It 'returns nothing when no folder file applies' {
+            Resolve-Test -Path $script:nested | Should -BeNullOrEmpty
+        }
+
+        It 'finds theme names in Poshify and oh-my-posh theme folders, in any format' {
+            Set-Content -LiteralPath (Join-Path $script:project '.poshify') -Value 'dracula'
+            (Resolve-Test -Path $script:nested).Path | Should -Be (Join-Path $script:home_ 'dracula.omp.yaml')
+
+            Set-Content -LiteralPath (Join-Path $script:project '.poshify') -Value 'agnoster'
+            $result = Resolve-Test -Path $script:nested
+            $result.Path | Should -Be (Join-Path $script:bundled 'agnoster.omp.json')
+            $result.Status | Should -Be 'Active'
+        }
+
+        It 'uses the nearest folder file' {
+            Set-Content -LiteralPath (Join-Path $script:project '.poshify') -Value 'atomic'
+            Set-Content -LiteralPath (Join-Path $script:project 'src/.poshify') -Value 'dracula'
+            (Resolve-Test -Path $script:nested).Value | Should -Be 'dracula'
+            (Resolve-Test -Path $script:project).Value | Should -Be 'atomic'
+        }
+
+        It 'reads .ompconfig files, preferring .poshify in the same folder' {
+            Set-Content -LiteralPath (Join-Path $script:project '.ompconfig') -Value 'atomic'
+            (Resolve-Test -Path $script:nested).Value | Should -Be 'atomic'
+
+            Set-Content -LiteralPath (Join-Path $script:project '.poshify') -Value 'dracula'
+            (Resolve-Test -Path $script:nested).Value | Should -Be 'dracula'
+        }
+
+        It 'skips comments and blank lines' {
+            Set-Content -LiteralPath (Join-Path $script:project '.poshify') -Value '# project theme', '', '  atomic  '
+            (Resolve-Test -Path $script:project).Value | Should -Be 'atomic'
+        }
+
+        It 'ignores folders named .poshify' {
+            New-Item -ItemType Directory -Path (Join-Path $script:project '.poshify') | Out-Null
+            Resolve-Test -Path $script:project | Should -BeNullOrEmpty
+        }
+
+        It 'reports themes that are not installed' {
+            Set-Content -LiteralPath (Join-Path $script:project '.poshify') -Value 'night-owl'
+            $result = Resolve-Test -Path $script:project
+            $result.Status | Should -Be 'NotFound'
+            $result.Path | Should -BeNullOrEmpty
+            $result.Message | Should -Match 'Poshify theme install night-owl'
+        }
+
+        It 'requires trust for theme files outside the theme folders, tied to their content' {
+            $themeFile = Join-Path $script:project 'mine.omp.json'
+            Set-Content -LiteralPath $themeFile -Value '{}'
+            Set-Content -LiteralPath (Join-Path $script:project '.poshify') -Value 'mine.omp.json'
+
+            $result = Resolve-Test -Path $script:nested
+            $result.Status | Should -Be 'Untrusted'
+            $result.Path | Should -BeNullOrEmpty
+            $result.File | Should -Be $themeFile
+
+            InModuleScope Poshify -Parameters @{ File = $themeFile } { param($File) Add-PoshifyTrust -File $File }
+            (Resolve-Test -Path $script:nested).Path | Should -Be $themeFile
+
+            Set-Content -LiteralPath $themeFile -Value '{ "changed": true }'
+            (Resolve-Test -Path $script:nested).Status | Should -Be 'Untrusted'
+        }
+
+        It 'trusts paths that point into the theme folders' {
+            Set-Content -LiteralPath (Join-Path $script:project '.poshify') -Value (Join-Path $script:home_ 'atomic.omp.json')
+            (Resolve-Test -Path $script:project).Status | Should -Be 'Active'
+        }
+    }
+
+    Context 'Default theme selection' {
+        BeforeEach {
+            New-ThemeFile -Directory $script:bundled -FileName 'agnoster.omp.json', 'atomic.omp.json', 'paradox.omp.json'
+
+            function script:Select-Test {
+                InModuleScope Poshify -Parameters @{ PoshifyHome = $script:home_ } {
+                    param($PoshifyHome)
+                    Select-PoshifyDefaultThemeFile -PoshifyHome $PoshifyHome
+                }
+            }
+        }
+
+        It 'returns nothing without a selection' {
+            Select-Test | Should -BeNullOrEmpty
+        }
+
+        It 'returns the selected theme file' {
+            Set-PoshifyTheme -Name 'atomic' -NoApply
+            Select-Test | Should -Be (Join-Path $script:bundled 'atomic.omp.json')
+        }
+
+        It 'Set-PoshifyTheme -Random picks from all themes' {
+            Set-PoshifyTheme -Random -NoApply
+            Get-Content -LiteralPath (Join-Path $script:home_ 'current') | Should -Be 'random'
+            $picks = 1..30 | ForEach-Object { Split-Path -Leaf (Select-Test) } | Sort-Object -Unique
+            $picks.Count | Should -BeGreaterThan 1
+        }
+
+        It 'Set-PoshifyTheme -Random -FromFavorites picks only favorites' {
+            Add-PoshifyFavorite -Name 'paradox'
+            Set-PoshifyTheme -Random -FromFavorites -NoApply
+            Get-Content -LiteralPath (Join-Path $script:home_ 'current') | Should -Be 'random:favorites'
+            1..10 | ForEach-Object { Split-Path -Leaf (Select-Test) } | Sort-Object -Unique | Should -Be 'paradox.omp.json'
+        }
+
+        It 'Set-PoshifyTheme -Random -FromFavorites needs favorites' {
+            Set-PoshifyTheme -Random -FromFavorites -NoApply -ErrorVariable err -ErrorAction SilentlyContinue
+            "$err" | Should -Match 'favorite'
+            Join-Path $script:home_ 'current' | Should -Not -Exist
+        }
+    }
+
+    Context 'Folder theme commands' {
+        BeforeEach {
+            New-ThemeFile -Directory $script:bundled -FileName 'agnoster.omp.json', 'atomic.omp.json'
+            $script:project = Join-Path $TestDrive 'projects/app'
+            New-Item -ItemType Directory -Path (Join-Path $script:project 'src') -Force | Out-Null
+            $script:marker = Join-Path $script:project '.poshify'
+        }
+
+        It 'writes a .poshify file with the exact theme name and sets up the profile' {
+            Set-PoshifyFolderTheme -Name 'atom' -Path $script:project
+            (Get-Content -LiteralPath $script:marker).Trim() | Should -Be 'atomic'
+            Get-Content -LiteralPath $script:profilePath -Raw | Should -Match '# >>> poshify >>>'
+            Join-Path $script:home_ 'init.ps1' | Should -Exist
+        }
+
+        It 'downloads a theme that is only available online' {
+            Mock Get-PoshifyOnlineThemeList -ModuleName Poshify {
+                [PSCustomObject]@{ PSTypeName = 'Poshify.OnlineTheme'; Name = 'night-owl'; FileName = 'night-owl.omp.json'; DownloadUrl = 'https://example.test/night-owl.omp.json'; Sha = 'x' }
+            }
+            Mock Invoke-WebRequest -ModuleName Poshify { Set-Content -LiteralPath $OutFile -Value '{}' }
+
+            Set-PoshifyFolderTheme -Name 'night-owl' -Path $script:project
+            Join-Path $script:home_ 'night-owl.omp.json' | Should -Exist
+            (Get-PoshifyFolderTheme -Path $script:project).Status | Should -Be 'Active'
+        }
+
+        It 'stores a project theme file relative to the folder and trusts it' {
+            $themeFile = Join-Path $script:project 'src/project.omp.json'
+            Set-Content -LiteralPath $themeFile -Value '{}'
+
+            Set-PoshifyFolderTheme -ThemePath $themeFile -Path $script:project
+
+            (Get-Content -LiteralPath $script:marker).Trim() | Should -Be ([IO.Path]::Combine('src', 'project.omp.json'))
+            $folderTheme = Get-PoshifyFolderTheme -Path (Join-Path $script:project 'src')
+            $folderTheme.Status | Should -Be 'Active'
+            $folderTheme.Theme | Should -Be 'project'
+        }
+
+        It 'shows untrusted folder themes until they are approved' {
+            Set-Content -LiteralPath (Join-Path $script:project 'evil.omp.json') -Value '{}'
+            Set-Content -LiteralPath $script:marker -Value 'evil.omp.json'
+
+            $folderTheme = Get-PoshifyFolderTheme -Path $script:project
+            $folderTheme.Status | Should -Be 'Untrusted'
+            $folderTheme.Message | Should -Match 'Poshify folder trust'
+
+            Approve-PoshifyFolderTheme -Path $script:project -WhatIf
+            (Get-PoshifyFolderTheme -Path $script:project).Status | Should -Be 'Untrusted'
+
+            Approve-PoshifyFolderTheme -Path $script:project
+            (Get-PoshifyFolderTheme -Path $script:project).Status | Should -Be 'Active'
+        }
+
+        It 'clears .poshify and .ompconfig files and mentions inherited themes' {
+            Set-Content -LiteralPath (Join-Path $TestDrive 'projects/.poshify') -Value 'agnoster'
+            Set-Content -LiteralPath $script:marker -Value 'atomic'
+            Set-Content -LiteralPath (Join-Path $script:project '.ompconfig') -Value 'atomic'
+
+            Clear-PoshifyFolderTheme -Path $script:project -WarningVariable warnings -WarningAction SilentlyContinue
+
+            $script:marker | Should -Not -Exist
+            Join-Path $script:project '.ompconfig' | Should -Not -Exist
+            "$warnings" | Should -Match 'still gets a theme'
+            (Get-PoshifyFolderTheme -Path $script:project).Theme | Should -Be 'agnoster'
+        }
+
+        It 'changes nothing with -WhatIf' {
+            Set-PoshifyFolderTheme -Name 'atomic' -Path $script:project -WhatIf
+            $script:marker | Should -Not -Exist
+
+            Set-Content -LiteralPath $script:marker -Value 'atomic'
+            Clear-PoshifyFolderTheme -Path $script:project -WhatIf
+            $script:marker | Should -Exist
+        }
+
+        It 'Get-PoshifyCurrentTheme reports the folder theme and why' {
+            Set-PoshifyTheme -Name 'agnoster' -NoApply
+            Set-PoshifyFolderTheme -Name 'atomic' -Path $script:project
+
+            $here = Get-PoshifyCurrentTheme -Path (Join-Path $script:project 'src')
+            $here.Name | Should -Be 'atomic'
+            $here.SelectedBy | Should -Match ([regex]::Escape($script:marker))
+
+            $elsewhere = Get-PoshifyCurrentTheme -Path $TestDrive
+            $elsewhere.Name | Should -Be 'agnoster'
+            $elsewhere.SelectedBy | Should -Be 'Default'
+        }
+
+        It 'is available as "Poshify folder ..."' {
+            Push-Location -LiteralPath $script:project
+            try {
+                Poshify folder set atomic 6>$null
+                (Get-Content -LiteralPath $script:marker).Trim() | Should -Be 'atomic'
+                Poshify folder clear 3>$null
+                $script:marker | Should -Not -Exist
+            }
+            finally {
+                Pop-Location
+            }
+        }
+    }
+
+    Context 'Generated init script' {
+        BeforeEach {
+            New-ThemeFile -Directory $script:home_ -FileName 'atomic.omp.json'
+            New-ThemeFile -Directory $script:bundled -FileName 'agnoster.omp.json'
+            $script:projectA = Join-Path $TestDrive 'work/a'
+            $script:projectB = Join-Path $TestDrive 'work/b'
+            New-Item -ItemType Directory -Path (Join-Path $script:projectA 'sub'), $script:projectB -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $script:projectA '.poshify') -Value 'atomic'
+            Set-Content -LiteralPath (Join-Path $script:projectB 'evil.omp.json') -Value '{}'
+            Set-Content -LiteralPath (Join-Path $script:projectB '.poshify') -Value 'evil.omp.json'
+
+            # A fake oh-my-posh whose init script records the config and installs a recognisable prompt
+            $script:bin = Join-Path $TestDrive 'bin'
+            New-Item -ItemType Directory -Path $script:bin -Force | Out-Null
+            if ($PSVersionTable.PSEdition -eq 'Desktop' -or $IsWindows) {
+                Set-Content -LiteralPath (Join-Path $script:bin 'oh-my-posh.cmd') -Encoding ASCII -Value @(
+                    '@echo off'
+                    'if "%1"=="init" echo $global:PoshifyFakeInits += ,''%~4''; function global:prompt { ''OMP:%~n4 '' }'
+                )
+            }
+            else {
+                $fake = Join-Path $script:bin 'oh-my-posh'
+                Set-Content -LiteralPath $fake -Value @(
+                    '#!/bin/sh'
+                    'if [ "$1" = "init" ]; then name=$(basename "$4" .json); echo "\$global:PoshifyFakeInits += ,''$4''; function global:prompt { ''OMP:$name '' }"; fi'
+                )
+                chmod +x $fake
+            }
+
+            Set-PoshifyTheme -Name 'agnoster' -NoApply
+        }
+
+        It 'switches themes by folder, warns once about untrusted themes and keeps the exit code' {
+            $initScript = Join-Path $script:home_ 'init.ps1'
+            $initScript | Should -Exist
+            $script = @"
+`$env:PATH = '$($script:bin)' + [IO.Path]::PathSeparator + `$env:PATH
+`$env:POSH_THEMES_PATH = '$($script:bundled)'
+. '$initScript'
+'start=' + (prompt)
+Set-Location -LiteralPath '$($script:projectA)'; 'a=' + (prompt)
+Set-Location -LiteralPath '$(Join-Path $script:projectA 'sub')'; 'sub=' + (prompt)
+Set-Location -LiteralPath '$($script:projectB)'; 'b=' + (prompt)
+Set-Location -LiteralPath '$($script:projectA)'; 'a2=' + (prompt)
+Set-Location -LiteralPath '$($script:projectB)'; 'b2=' + (prompt)
+`$global:LASTEXITCODE = 7; `$null = prompt; 'exit=' + `$global:LASTEXITCODE
+'status=' + (`$global:NVS_ORIGINAL_LASTEXECUTIONSTATUS -is [bool])
+'inits=' + `$global:PoshifyFakeInits.Count
+"@
+            $exe = (Get-Process -Id $PID).Path
+            $output = & $exe -NoProfile -NonInteractive -Command $script 2>&1 | ForEach-Object { "$_".Trim() }
+
+            $output | Should -Contain 'start=OMP:agnoster.omp'
+            $output | Should -Contain 'a=OMP:atomic.omp'
+            $output | Should -Contain 'sub=OMP:atomic.omp'
+            $output | Should -Contain 'b=OMP:agnoster.omp'
+            $output | Should -Contain 'a2=OMP:atomic.omp'
+            $output | Should -Contain 'exit=7'
+            $output | Should -Contain 'status=True'
+            # agnoster, atomic, agnoster, atomic, agnoster: no re-init inside the same theme
+            $output | Should -Contain 'inits=5'
+            @($output | Where-Object { $_ -match "isn't trusted" }).Count | Should -Be 1
+        }
+
+        It 'does nothing when oh-my-posh is not installed' {
+            $initScript = Join-Path $script:home_ 'init.ps1'
+            $exe = (Get-Process -Id $PID).Path
+            $script = "`$env:PATH = ''; . '$initScript'; 'loaded=' + [bool]`$global:_poshifyUpdate"
+            $output = & $exe -NoProfile -NonInteractive -Command $script 2>&1 | ForEach-Object { "$_".Trim() }
+            $output | Should -Contain 'loaded=False'
+        }
+
+        It 'is rewritten only when its content changes' {
+            $initScript = Join-Path $script:home_ 'init.ps1'
+            (Get-Item -LiteralPath $initScript).LastWriteTime = [datetime]'2000-01-01'
+            Set-PoshifyTheme -Name 'atomic' -NoApply
+            (Get-Item -LiteralPath $initScript).LastWriteTime | Should -Be ([datetime]'2000-01-01')
+        }
+
+        It 'Reset removes it' {
+            Reset-PoshifyTheme
+            Join-Path $script:home_ 'init.ps1' | Should -Not -Exist
         }
     }
 }
